@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "fimemory",
+  "displayName": "FIMemory",
+  "version": "0.3.0",
+  "description": "Local-first shared memory for AI tools. Plain files are the source of truth; relevant context is injected before your prompt instead of burned on agentic search loops.",
+  "author": {
+    "name": "Future Industries",
+    "email": "eric@futureindustries.info",
+    "url": "https://futureindustries.ai"
+  },
+  "homepage": "https://futureindustries.ai/memory.html",
+  "license": "FSL-1.1-ALv2",
+  "keywords": [
+    "memory",
+    "mcp",
+    "local-first",
+    "context",
+    "retrieval",
+    "knowledge-base"
+  ],
+  "mcpServers": "./.mcp.json",
+  "hooks": "./hooks/hooks.json"
+}

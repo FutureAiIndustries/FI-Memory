@@ -1,0 +1,62 @@
+[
+  {
+    "id": "pricing-model",
+    "question": "How does the studio price work, and why did it stop billing hourly?",
+    "queryTerms": ["hourly", "fixed", "fee"],
+    "expectedTopics": ["studio-pricing-model"]
+  },
+  {
+    "id": "change-orders",
+    "question": "What happens when a client asks for a third round of revisions?",
+    "queryTerms": ["revision", "rounds", "change"],
+    "expectedTopics": ["scope-change-orders"]
+  },
+  {
+    "id": "invoicing",
+    "question": "What are the payment terms, and what do we do when an invoice runs late?",
+    "queryTerms": ["deposit", "invoice", "overdue"],
+    "expectedTopics": ["studio-invoicing-terms"]
+  },
+  {
+    "id": "font-licensing",
+    "question": "Can we use a licensed typeface on a client's website?",
+    "queryTerms": ["typeface", "licence", "webfont"],
+    "expectedTopics": ["font-licensing-rules"]
+  },
+  {
+    "id": "press-colour",
+    "question": "Why does the same colour print differently on uncoated stock?",
+    "queryTerms": ["uncoated", "stock", "colour"],
+    "expectedTopics": ["press-color-profiles"]
+  },
+  {
+    "id": "proofing",
+    "question": "What gets checked before artwork leaves the studio?",
+    "queryTerms": ["proof", "bleed", "overprint"],
+    "expectedTopics": ["print-proofing-checklist"]
+  },
+  {
+    "id": "label-system",
+    "question": "How does the cider label system flex across varieties?",
+    "queryTerms": ["label", "variety", "shelf"],
+    "expectedTopics": ["bramblewell-label-system"]
+  },
+  {
+    "id": "fleet-livery",
+    "question": "How is the livery designed so it still reads on a moving lorry?",
+    "queryTerms": ["vinyl", "livery", "vehicle"],
+    "expectedTopics": ["ridgehaul-fleet-livery"]
+  },
+  {
+    "id": "design-system",
+    "question": "How is the spacing scale defined in the product design system?",
+    "queryTerms": ["spacing", "scale", "tokens"],
+    "expectedTopics": ["fernpost-design-system"]
+  },
+  {
+    "id": "turned-down",
+    "question": "What work did the studio decline, and what was the reasoning?",
+    "queryTerms": ["retainer", "turned", "down"],
+    "expectedTopics": ["work-we-turned-down"]
+  }
+]

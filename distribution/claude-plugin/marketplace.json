@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "futureindustries",
+  "owner": {
+    "name": "Future Industries",
+    "email": "eric@futureindustries.info",
+    "url": "https://futureindustries.ai"
+  },
+  "description": "Future Industries tools. FIMemory: local-first shared memory for AI tools — MCP + prompt-time retrieval inject.",
+  "plugins": [
+    {
+      "name": "fimemory",
+      "source": "./distribution/claude-plugin/fimemory",
+      "description": "Local-first shared memory: fimemory MCP tools + prompt-time retrieval hooks (shim), doctor, encrypted store support.",
+      "version": "0.2.0",
+      "homepage": "https://futureindustries.ai/memory.html"
+    }
+  ]
+}

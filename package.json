@@ -1,0 +1,60 @@
+{
+  "name": "fimemory",
+  "version": "0.3.0",
+  "description": "FIMemory, by Future Industries — a local store your AI tools can read, once connected and told to. Plain files on your own disk; optional encryption at rest.",
+  "license": "SEE LICENSE IN LICENSE.md",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "fimemory": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "src",
+    "LICENSE.md",
+    "SUPPORTERS.md",
+    "README.md"
+  ],
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint ."
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^26.1.1",
+    "@types/proper-lockfile": "^4.1.4",
+    "eslint": "^10.7.0",
+    "tsx": "^4.23.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.63.0",
+    "vitest": "^4.1.10"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^2.2.0",
+    "@noble/hashes": "^2.2.0",
+    "@scure/bip39": "^2.2.0",
+    "js-yaml": "^5.2.1",
+    "proper-lockfile": "^4.1.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FutureAiIndustries/FI-Memory.git"
+  },
+  "homepage": "https://futureindustries.ai/memory.html",
+  "mcpName": "io.github.FutureAiIndustries/fimemory"
+}

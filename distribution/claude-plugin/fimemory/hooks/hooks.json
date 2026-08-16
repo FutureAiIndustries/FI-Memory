@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "fimemory hook-retrieve --shim-id fimemory-v1",
+            "timeout": 10000
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "fimemory hook-retrieve --shim-id fimemory-v1",
+            "timeout": 10000
+          }
+        ]
+      }
+    ]
+  }
+}
