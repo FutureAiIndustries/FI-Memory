@@ -34,8 +34,12 @@ export function reviewList(home: string): Promise<ProposalMeta[]> {
   return listProposals(home);
 }
 
-export async function reviewShow(home: string, seq: number): Promise<ProposalDoc> {
-  const found = await findProposal(home, seq);
+export async function reviewShow(
+  home: string,
+  seq: number,
+  machineId?: string,
+): Promise<ProposalDoc> {
+  const found = await findProposal(home, seq, machineId);
   if (!found) throw notFoundProposal(seq);
   const doc = parseProposal(found.text);
   if (!doc) throw unparsableProposal(seq);
@@ -45,6 +49,18 @@ export async function reviewShow(home: string, seq: number): Promise<ProposalDoc
 export interface ApproveOptions {
   allowOwnerNotes?: boolean;
   now?: Clock;
+  /**
+   * Which machine's proposal, when more than one minted the same seq.
+   *
+   * Proposal numbers are per-clone counters, so on three machines two
+   * independent conflict resolutions both land on the same N. findProposal has
+   * always been able to disambiguate, but nothing could ASK it to: the
+   * ambiguity error told the owner to disambiguate with the machine-scoped
+   * filename, and the CLI had no way to express one -- so the resolver's own
+   * printed `review approve N` was unusable and neither side could be picked.
+   * No data was ever at risk; the human simply could not act.
+   */
+  machineId?: string;
 }
 
 /**
@@ -63,7 +79,7 @@ export async function reviewApprove(
   const now = opts.now ?? systemClock;
 
   return withLock(home, config.lockWaitMs, async () => {
-    const found = await findProposal(home, seq);
+    const found = await findProposal(home, seq, opts.machineId);
     if (!found) throw notFoundProposal(seq);
     const doc = parseProposal(found.text);
     if (!doc) throw unparsableProposal(seq);
@@ -184,10 +200,14 @@ export async function reviewApprove(
   });
 }
 
-export async function reviewReject(home: string, seq: number): Promise<{ id: string }> {
+export async function reviewReject(
+  home: string,
+  seq: number,
+  machineId?: string,
+): Promise<{ id: string }> {
   const { config } = loadConfig(storePaths(home).config);
   return withLock(home, config.lockWaitMs, async () => {
-    const found = await findProposal(home, seq);
+    const found = await findProposal(home, seq, machineId);
     if (!found) throw notFoundProposal(seq);
     const doc = parseProposal(found.text);
     if (!doc) throw unparsableProposal(seq);

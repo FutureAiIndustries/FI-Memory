@@ -4,6 +4,22 @@ import { bytesToUtf8, concatBytes, utf8ToBytes } from "@noble/ciphers/utils.js";
 import { hkdf } from "@noble/hashes/hkdf.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { GestaltError } from "../errors.js";
+import { fsPath, storePaths } from "../paths.js";
+import { ENC_MAGIC } from "./wireFormat.js";
+// CYCLE, deliberate and load-order-checked: store/keyring.ts already imports
+// this module (activateDek/decryptFile/decodeLogEntry), so importing the store
+// GATE back from it closes a loop. It is safe because neither side touches the
+// other's bindings during module EVALUATION — `keyringExists`/`storeHasSealedContent`
+// are hoisted function declarations consumed only from inside `assertNotSealedStore`,
+// and keyring.ts (and store/log.ts, which it pulls in) likewise reads
+// SEALED_TOKEN_FLOOR and the codec functions only from inside its own functions.
+// Put anything from this module in a TOP-LEVEL initializer over there and the
+// cycle turns into a TDZ ReferenceError under Node's real ESM loader — which is
+// why test/sealed-store-guard.test.ts loads both modules FIRST in a real node
+// process, in both orders, rather than trusting vitest's own module emulation.
+// The alternative — re-deriving "is this store sealed?" here — is the copy that
+// drifts from the gate the CLI and doctor use, and drift is the whole defect.
+import { keyringExists, storeHasSealedContent } from "./keyring.js";
 
 /**
  * Storage codec seam — the single choke point through which every store file
@@ -81,7 +97,6 @@ const NONCE_SALT_LOG = utf8ToBytes("gestalt/log-nonce/v1");
 const NONCE_SALT_FILE = utf8ToBytes("gestalt/file-nonce/v1");
 const NONCE_SALT_LEDGER = utf8ToBytes("gestalt/ledger-nonce/v1");
 const XNONCE_LEN = 24;
-const ENC_MAGIC = "gestalt-enc:1:";
 /** Exported for ledger readers that need to detect sealed lines. */
 export const LEDGER_ENC_MAGIC = ENC_MAGIC;
 
@@ -125,6 +140,16 @@ let activeState: KeyState | null = null;
 let cachedKeyHex: string | undefined;
 let cachedEnvState: KeyState = { mode: "plaintext" };
 
+/**
+ * Bumped on EVERY change to this process's key situation — a DEK activated or
+ * cleared, a `GESTALT_KEY` that appeared, vanished or changed. It exists to
+ * invalidate the sealed-store memo below, and it is sound for that job because
+ * sealed bytes cannot appear in a store without a key: if THIS process is what
+ * sealed them, it passed through one of these three doors first, so a memo
+ * taken before the seal can never be reused after it.
+ */
+let keyEpoch = 0;
+
 const HEX64 = /^[0-9a-fA-F]{64}$/;
 
 /** Derive the AEAD/nonce sub-keys from a DEK (SIV key separation, RFC 5297 hygiene). */
@@ -144,11 +169,13 @@ export function activateDek(dek: Uint8Array): void {
     throw new GestaltError("E_STORE_MODE", "DEK must be 32 bytes.", "Bug in the unlock path.");
   }
   activeState = stateFromDek(dek);
+  keyEpoch++;
 }
 
 /** Clear any activated key (fall back to GESTALT_KEY env, else plaintext). */
 export function clearActiveKey(): void {
   activeState = null;
+  keyEpoch++;
 }
 
 /**
@@ -159,11 +186,15 @@ export function keyState(): KeyState {
   if (activeState) return activeState;
   const hex = process.env.GESTALT_KEY;
   if (!hex) {
+    // A key that WAS here and is now gone is a key-situation change like any
+    // other — the memo below must not carry a verdict across it.
+    if (cachedKeyHex !== undefined) keyEpoch++;
     cachedKeyHex = undefined;
     cachedEnvState = { mode: "plaintext" };
     return cachedEnvState;
   }
   if (hex === cachedKeyHex) return cachedEnvState;
+  keyEpoch++;
   const h = hex.trim();
   // Strict: reject anything but exactly 64 hex chars (Node's hex decoder would
   // otherwise silently truncate trailing junk to a valid-looking 32-byte key).
@@ -234,15 +265,115 @@ export function fileKind(filePath: string): FileKind {
   return "other";
 }
 
+/** What proved the store encrypted, so the refusal can name the right remedy. */
+type SealedEvidence = "keyring" | "marker" | "content";
+
+interface SealedScan {
+  sealed: boolean;
+  /** The key epoch this verdict was taken under; a bump retires it. */
+  epoch: number;
+  /** `Date.now()` when the scan STARTED (conservative — the memo ages sooner). */
+  at: number;
+  /** What the scan cost, which sets its own freshness budget (see below). */
+  costMs: number;
+}
+
+/**
+ * Per-home memo for the TREE SCAN half of the sealed-store gate.
+ *
+ * MEASURED, not assumed (dev box, Windows 11 with Defender live, plaintext
+ * store, warm OS cache): `storeHasSealedContent` costs ~0.34 ms per store file
+ * it head-reads — 3.5 ms at 1 note, 21.6 ms at 10, 110.8 ms at 50, 424.1 ms at
+ * 200, 1048.2 ms at 500. It is four finders over the same tree, so each note
+ * and proposal head is read twice and each log head four times. One `create`
+ * performs three guarded writes (note, log, index), so scanning per write would
+ * have put ~3 seconds on a single `create` in a 500-note store, and O(N) work
+ * on every write of every bulk path. That is not a cost a fail-closed guard is
+ * allowed to impose, and a guard people disable is a guard that does not exist.
+ *
+ * Capped at a handful of homes — a process only ever writes to one or two, and
+ * the suite churns thousands, so the map is dropped wholesale rather than grown.
+ */
+const sealedScans = new Map<string, SealedScan>();
+const SEALED_SCAN_MAX_HOMES = 32;
+
+/**
+ * How long a scan's verdict may be reused: at least 2 s, and never less than 20×
+ * what the scan itself cost, so re-proving the answer can never eat more than
+ * ~5% of a busy process's wall clock however big the store gets.
+ *
+ * A TTL is REQUIRED, not a nicety. The key epoch retires a verdict when THIS
+ * process changes its key situation, but sealed content also arrives from
+ * outside — a `git pull` on a store that another machine encrypted is exactly
+ * the 0.3.0 cross-machine story. A CLI invocation lives milliseconds and pays
+ * one scan; the long-lived MCP server would otherwise hold a "plaintext"
+ * verdict for its entire lifetime and keep writing cleartext into a store that
+ * had since become ciphertext. The O(1) evidence below is deliberately OUTSIDE
+ * the memo for the same reason: a pulled `store.enc` (tracked, unlike the
+ * gitignored keyring) refuses the very next write, TTL or no TTL.
+ */
+const SEALED_SCAN_MIN_TTL_MS = 2_000;
+const SEALED_SCAN_COST_BUDGET = 20;
+
+/**
+ * Is this store encrypted ON DISK? Cheap, always-fresh evidence first; the tree
+ * scan only when neither O(1) signal fires (i.e. for an ordinary plaintext
+ * store, which is precisely the case that must stay fast).
+ */
+function sealedEvidence(home: string): SealedEvidence | null {
+  // keyring.json present == this store was initialised encrypted. Its own
+  // writes are classified "config" and never reach this branch.
+  if (keyringExists(home)) return "keyring";
+  // store.enc is the always-present store-mode marker (store/keyring.ts) and,
+  // unlike keyring.json, it is NOT gitignored — so it travels in every clone.
+  if (existsSync(fsPath(storePaths(home).storeMarker))) return "marker";
+
+  const memo = sealedScans.get(home);
+  const now = Date.now();
+  if (
+    memo &&
+    memo.epoch === keyEpoch &&
+    now - memo.at < Math.max(SEALED_SCAN_MIN_TTL_MS, memo.costMs * SEALED_SCAN_COST_BUDGET)
+  ) {
+    return memo.sealed ? "content" : null;
+  }
+  const started = Date.now();
+  const sealed = storeHasSealedContent(home);
+  if (sealedScans.size >= SEALED_SCAN_MAX_HOMES) sealedScans.clear();
+  sealedScans.set(home, { sealed, epoch: keyEpoch, at: started, costMs: Date.now() - started });
+  return sealed ? "content" : null;
+}
+
 /**
  * Refuse a plaintext write into a store that is encrypted on disk.
  *
  * Derives the store home from the file's own path: the layout is exactly one
  * level deep (`<home>/{topics,logs,proposals,ledgers}/<id>.ext`), and
  * index.json / config.json / store.enc sit at the root, so the home is either
- * the parent or the grandparent. Cheap (one existsSync on a path we already
- * have) and only ever reached on the plaintext branch, so encrypted writes pay
- * nothing.
+ * the parent or the grandparent. Only ever reached on the plaintext branch, so
+ * encrypted writes pay nothing.
+ *
+ * WHAT COUNTS AS ENCRYPTED (B1, 2026-08-17). This used to test one thing —
+ * `existsSync(<home>/keyring.json)` — and `fimemory init` GITIGNORES that file
+ * on purpose: it is the per-machine wrapped key and must travel out of band. So
+ * the single fact the guard keyed on is absent from every CLONE of an encrypted
+ * store BY DESIGN. The guard returned early there and notes, logs and
+ * index.json were accepted as cleartext into a tree of ciphertext; restoring
+ * the keyring afterwards wedges the store, because the reader then fails closed
+ * on exactly the files the writer had just added. The evidence has to be the
+ * store's CONTENT, not a file the sync layer deliberately withholds — so the
+ * gate the CLI, doctor, export and the migrations already share
+ * (`storeHasSealedContent`) moves HERE, to the choke point every store write
+ * passes through. Fixing the one caller that surfaced the bug would have left
+ * the next forgetful write path with the identical hole.
+ *
+ * FALSE POSITIVES ARE THE THING TO FEAR, and the direction is asymmetric: a
+ * store wrongly called sealed refuses every write the user makes. So this adds
+ * no heuristic of its own. `storeHasSealedContent` is the same conservative
+ * gate that already decides this question everywhere else — a sealed-token
+ * FLOOR so a hand-typed `<ts> deployed` log line is not read as ciphertext, and
+ * git conflict-marker evidence required before a mid-file magic string counts.
+ * A genuinely plaintext store trips none of it and writes exactly as before.
  */
 function assertNotSealedStore(filePath: string): void {
   const p = filePath.replace(/\\/g, "/");
@@ -254,13 +385,14 @@ function assertNotSealedStore(filePath: string): void {
     ? dir.slice(0, dir.lastIndexOf("/"))
     : dir;
   if (!home) return;
-  // keyring.json present == this store was initialised encrypted. Its own
-  // writes are classified "config" and never reach this branch.
-  if (!existsSync(`${home}/keyring.json`)) return;
+  const evidence = sealedEvidence(home);
+  if (!evidence) return;
   throw new GestaltError(
     "E_STORE_MODE",
     `Refusing to write ${baseName(filePath)} as plaintext: this store is encrypted, but no key is active right now.`,
-    "The key was cleared while this write was in flight (a lock, a failed unlock, or a concurrent recover). Unlock and retry — nothing was written.",
+    evidence === "keyring"
+      ? "The key was cleared while this write was in flight (a lock, a failed unlock, or a concurrent recover). Unlock and retry — nothing was written."
+      : "This store holds encrypted content but no keyring.json — the usual cause is a clone or restore, since keyring.json is gitignored and travels out of band. Copy it across, or run `fimemory recover` with the 24-word phrase, then retry. Nothing was written.",
   );
 }
 

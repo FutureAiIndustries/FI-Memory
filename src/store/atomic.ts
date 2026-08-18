@@ -114,6 +114,13 @@ export async function writeFileAtomicPlain(
   content: string,
 ): Promise<void> {
   const dir = path.dirname(target);
+  // Create the parent if it is missing. This is not defensive padding: GIT DOES
+  // NOT TRACK EMPTY DIRECTORIES, so a store cloned before it ever logged
+  // anything arrives on the second machine with no `logs/` at all. The temp file
+  // this write depends on then fails with a raw ENOENT on a path the user never
+  // typed. Found by a two-machine probe whose store was minimal; every fixture
+  // built by `fimemory init` has the directory already and cannot reach it.
+  await fsp.mkdir(dir, { recursive: true });
   const tmp = path.join(
     dir,
     `.${path.basename(target)}.tmp-${process.pid}-${tmpCounter++}`,

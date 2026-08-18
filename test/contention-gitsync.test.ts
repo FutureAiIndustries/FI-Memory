@@ -55,7 +55,8 @@ import { createTopic } from "../src/ops/create.js";
 import { get } from "../src/ops/get.js";
 import { appendLog } from "../src/ops/logOp.js";
 import { reindexStore } from "../src/ops/reindexOp.js";
-import { reviewApprove } from "../src/ops/review.js";
+import { resolveConflicts } from "../src/ops/resolveConflicts.js";
+import { reviewApprove, reviewShow } from "../src/ops/review.js";
 import { search } from "../src/ops/search.js";
 import { ensureStoreUnlocked } from "../src/ops/unlockOp.js";
 import { updateTopic } from "../src/ops/update.js";
@@ -254,7 +255,7 @@ describe("git-synced team store (TEAM-PLAYBOOK shape)", () => {
     await reindexStore(owner);
   }, 30_000);
 
-  it("two clones approving different edits to one note: git conflicts (correctly) on an opaque blob", async () => {
+  it("two clones approving different edits to one note: git ALONE conflicts on an opaque blob", async () => {
     // Owner proposes + approves an edit.
     const ownerNote = (await readText(topicNotePath(owner, TOPIC)))!;
     const ownerSeq = (
@@ -300,9 +301,11 @@ describe("git-synced team store (TEAM-PLAYBOOK shape)", () => {
     // must: it is one whole-file sealed blob with two different edits.
     expect(conflicted.filter((f) => f.startsWith("proposals/"))).toEqual([]);
 
-    // What the user is looking at: conflict markers wrapped around two
-    // base64 blobs. There is no hand-merge here — nobody can read either side,
-    // and the runtime fails closed rather than pretending.
+    // What a RAW `git merge` leaves: conflict markers wrapped around two base64
+    // blobs. There is no hand-merge here — nobody can read either side, and the
+    // runtime fails closed rather than pretending. This is the state the pull
+    // resolver is handed, not an outcome any user is expected to fix. Raw
+    // `git pull`/`git merge` in a store stays unsupported (0.3.0 plan §7).
     const raw = readFileSync(fsPath(topicNotePath(mate, TOPIC)), "utf8");
     expect(hasConflictMarkers(raw)).toBe(true);
     expect(raw).not.toContain("The owner decided X.");
@@ -311,26 +314,39 @@ describe("git-synced team store (TEAM-PLAYBOOK shape)", () => {
     );
   }, 30_000);
 
-  it("after resolving with `git checkout --theirs` + reindex, the store is valid — but the log now claims an edit that is gone", async () => {
-    // The only resolution available for an opaque blob: pick a side wholesale.
-    // "theirs" = origin/main = the owner's approved edit.
-    // Only the note conflicts now (see the previous test): the machine-scoped
-    // proposal filenames merged cleanly, so there is no proposal to pick a
-    // side on. Naming a non-conflicted path here makes git fail the whole
-    // checkout, which is how the team-sync merge first surfaced.
-    git(mate, "checkout", "--theirs", "--", `topics/${TOPIC}.md`);
-    git(mate, "add", "-A");
-    git(mate, "commit", "-q", "-m", "resolve: take the owner's note");
+  it("the store's own resolver keeps BOTH sides: one body live, the other a pending proposal", async () => {
+    // REPLACES the old `git checkout --theirs` case, which asserted that
+    // resolving a dual approve DROPS one body and leaves the log claiming an
+    // edit that is gone. That is the behaviour the 0.3.0 conflict resolver
+    // exists to end (plan §1): never drop a side, never leave a marker, the
+    // store stays readable, a human picks.
+    //
+    // Winner = the larger `updated:`, tie to ours — last-write-wins on each
+    // machine's own clock, nothing cleverer. The teammate approved at
+    // T0+23_000 and the owner at T0+21_000, so the TEAMMATE's body stays live
+    // here and the owner's becomes an ordinary pending proposal.
+    const res = await resolveConflicts(mate, { env: GIT_ENV, now: clockAt(T0 + 24_000) });
+    git(mate, "commit", "-q", "--no-edit");
+
+    const resolved = res.notes.find((n) => n.id === TOPIC)!;
+    expect(resolved.winner).toBe("ours");
+    const minted = resolved.proposal!;
 
     const note = (await readText(topicNotePath(mate, TOPIC)))!;
-    expect(note).toContain("The owner decided X.");
-    expect(note).not.toContain("The teammate decided Y."); // the other edit is gone
+    expect(note).toContain("The teammate decided Y."); // larger `updated:`
+    expect(note).not.toContain("The owner decided X.");
+    expect(hasConflictMarkers(readFileSync(fsPath(topicNotePath(mate, TOPIC)), "utf8"))).toBe(false);
+    // Still sealed at rest — resolution went through the codec, not around it.
+    expect(readFileSync(fsPath(topicNotePath(mate, TOPIC)), "utf8")).toMatch(/^gestalt-enc:1:/);
+
+    // The owner's body is NOT gone. It is filed, whole, one command away.
+    const filed = await reviewShow(mate, minted.seq);
+    expect(filed.id).toBe(TOPIC);
+    expect(filed.newNote).toContain("The owner decided X.");
 
     const { index, warnings } = await reindexStore(mate);
     expect(warnings).toEqual([]);
     expect(Object.keys(index.topics)).toContain(TOPIC);
-    const hits = await search(mate, "owner decided");
-    expect(hits.hits.map((h) => h.id)).toContain(TOPIC);
 
     // Every log entry ever written is still present (union merge never drops).
     const entries = parseLog((await readText(topicLogPath(mate, TOPIC)))!, TOPIC).entries;
@@ -338,29 +354,47 @@ describe("git-synced team store (TEAM-PLAYBOOK shape)", () => {
     expect(summaries).toContain(TEAM_FACT);
     expect(summaries).toContain("entry from the owner machine");
     expect(summaries).toContain("entry from the teammate machine");
-
-    // …including BOTH auto-entries. The history now records two approved note
-    // edits when only one of them is in the note: the log is honest about what
-    // each machine did, and misleading about what the store contains. A user
-    // reading the log will look for "decided Y" and never find it, with nothing
-    // anywhere recording that it was dropped in a conflict resolution.
     const approvals = summaries.filter((s) => s.startsWith("Note updated via proposal"));
     expect(approvals).toHaveLength(2);
     expect(approvals.some((s) => s.includes("by owner"))).toBe(true);
     expect(approvals.some((s) => s.includes("by teammate"))).toBe(true);
+
+    // …and, unlike the old resolution, the log now RECORDS that a side was
+    // filed rather than leaving a reader hunting for an edit that is not there.
+    // The excerpt is what makes the dropped body findable: `search` reads notes
+    // and log entries, never `proposals/`.
+    expect(summaries.some((s) => s.includes("Cross-machine merge"))).toBe(true);
+    expect((await search(mate, "owner decided")).hits.map((h) => h.id)).toContain(TOPIC);
+
+    // Approving it swaps the owner's body back in, first try — this is where a
+    // hash taken over pre-`serializeNote` bytes would surface as E_STALE.
+    //
+    // NOTE for whoever reads the two `it.fails` tripwires below: minting this
+    // proposal advances THIS clone's `nextSeq` past the owner's, so the
+    // "every pending proposal stays reachable by its seq" case no longer
+    // reaches its collision setup — it now fails at `expect(a.seq).toBe(b.seq)`.
+    // It is still red, so the tripwire is still green, but it is no longer
+    // proving what it was written to prove.
+    await reviewApprove(mate, minted.seq);
+    const swapped = (await readText(topicNotePath(mate, TOPIC)))!;
+    expect(swapped).toContain("The owner decided X.");
   }, 30_000);
 
-  it.fails("DEFECT: a union-merged log is still in timestamp order", async () => {
-    // `merge=union` concatenates the conflicting hunk as OURS-then-THEIRS, so
-    // the entries the remote wrote land AFTER the ones this machine wrote,
-    // whatever the clock says. Nothing re-sorts: `serializeLog` re-emits the
-    // parsed array in file order, so the disorder is permanent from the first
-    // merge onward and compounds with every sync.
-    //
-    // That matters because position IS the runtime's idea of recency. `get
-    // --log-tail N` takes `entries.slice(-N)` — the last N LINES, not the
-    // newest N entries — so the log tail handed to an AI silently omits the
-    // newest thing the team learned, and shows an older entry in its place.
+  // FIXED by W-E (sort-on-parse), so this is no longer `it.fails` — it is now an
+  // ordinary assertion guarding the repaired behaviour. Per the project's
+  // defect-registry process, a fixed defect's tripwire is unmarked rather than
+  // deleted: the case that proved the bug becomes the case that stops it coming
+  // back.
+  //
+  // The original defect, kept because it explains what the assertion is for:
+  // `merge=union` concatenates the conflicting hunk as OURS-then-THEIRS, so the
+  // entries the remote wrote landed AFTER the ones this machine wrote, whatever
+  // the clock said, and nothing re-sorted. Position IS the runtime's idea of
+  // recency for every reader except `get`, which sorts for itself — so `compact`
+  // folding `entries.slice(-N)` would drop the newest team fact and keep an
+  // older local one. parseLog now sorts on both the plaintext and encrypted
+  // paths, so the invariant belongs to the parse and every reader inherits it.
+  it("a union-merged log comes back in timestamp order", async () => {
     const entries = parseLog((await readText(topicLogPath(mate, TOPIC)))!, TOPIC).entries;
     const timestamps = entries.map((e) => e.timestamp);
     const newest = [...timestamps].sort().at(-1)!;
@@ -370,47 +404,20 @@ describe("git-synced team store (TEAM-PLAYBOOK shape)", () => {
     expect(tail.topics[0]!.logTail).toContain(newestSummary);
     expect([...timestamps].sort()).toEqual(timestamps);
   }, 30_000);
-
-  it.fails("DEFECT: every pending proposal stays reachable by its seq", async () => {
-    // Same per-clone counter, different topics this time, so the filenames
-    // differ and git merges both without a murmur. Now two live proposals
-    // share seq 3.
-    const ownerNote = (await readText(topicNotePath(owner, TOPIC)))!;
-    const a = await updateTopic(owner, TOPIC, editBody(ownerNote, "Owner proposes A."), {
-      proposer: "owner",
-      now: clockAt(T0 + 30_000),
-    });
-    commitAndPush(owner, "owner: proposal on widget");
-
-    await createTopic(mate, "harbor", "Harbor rollout", { now: clockAt(T0 + 31_000) });
-    const harborNote = (await readText(topicNotePath(mate, "harbor")))!;
-    const b = await updateTopic(mate, "harbor", editBody(harborNote, "Teammate proposes B."), {
-      proposer: "teammate",
-      now: clockAt(T0 + 32_000),
-    });
-    git(mate, "add", "-A");
-    git(mate, "commit", "-q", "-m", "teammate: proposal on harbor");
-    git(mate, "fetch", "-q", "origin");
-    const merge = gitTry(mate, "merge", "--no-edit", "origin/main");
-    expect(merge.ok).toBe(true); // different filenames — merges clean, no warning
-    expect(a.seq).toBe(b.seq); // …and both carry the same seq
-
-    const pending = (await listProposals(mate)).filter((p) => p.status === "pending");
-    const collided = pending.filter((p) => p.seq === a.seq);
-    expect(collided).toHaveLength(2);
-
-    // `review show/approve/reject N` resolve a proposal by seq, and the lookup
-    // returns the FIRST filename that matches — so one of these two can never
-    // be shown, approved or rejected. It sits pending forever, eating a slot in
-    // the maxPendingProposals budget. The property that should hold: every
-    // pending proposal is reachable by its own seq. It does not.
-    const reachable = new Set<string>();
-    for (const p of collided) {
-      const found = await findProposal(mate, p.seq!);
-      if (found) reachable.add(path.basename(found.path));
-    }
-    expect([...reachable].sort()).toEqual(collided.map((p) => p.file).sort());
-  }, 30_000);
+  // WAS `it.fails("DEFECT: every pending proposal stays reachable by its seq")`.
+  //
+  // The defect is FIXED — `--machine <id>` on review show/approve/reject, and a
+  // bare lookup now refuses an ambiguous seq instead of silently answering with
+  // whichever file it happened to read first. The property moved to
+  // test/resolve-conflicts.test.ts rather than being unmarked in place, for a
+  // reason worth recording: this fixture only produced a collision when two
+  // per-clone counters happened to line up, and the merge-resolver test added
+  // above now mints a proposal and shifts them. The tripwire had already stopped
+  // reaching its own assertion — still red, so still reading green, while
+  // proving nothing. A property that depends on counter arithmetic in a shared
+  // fixture is a property that will quietly stop being tested again, so it now
+  // lives next to the resolver that relies on it, with the collision built
+  // explicitly instead of awaited.
 
   it("index.json is derived, so the merge-hostile file never reaches the remote — and reindex is authoritative", async () => {
     // The prime suspect for a merge-hostile file is index.json: it is a whole

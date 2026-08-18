@@ -1,7 +1,9 @@
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { expect } from "vitest";
 import { GestaltError } from "../src/errors.js";
 import type { ErrorCode } from "../src/errors.js";
@@ -158,4 +160,127 @@ export function writeNote(
   };
   writeFileSync(fsPath(topicNotePath(home, id)), serializeNote(note), "utf8");
   writeFileSync(fsPath(topicLogPath(home, id)), `# ${id} log\n`, "utf8");
+}
+
+/** What the real CLI did: its exit code and both streams, verbatim. */
+export interface CliRun {
+  /** The child's exit code. -1 means it died on a signal instead of exiting. */
+  code: number;
+  stdout: string;
+  stderr: string;
+  /** The store home the child resolved to, so callers can inspect it after. */
+  home: string;
+}
+
+export interface CliRunOptions {
+  /**
+   * The store the child resolves by DEFAULT (via GESTALT_HOME) — i.e. with no
+   * `--home` flag, which is how every real user runs it. Defaults to a fresh,
+   * not-yet-created path so a test that forgets to seed a store gets an empty
+   * one of its own rather than whatever the last test left behind.
+   */
+  home?: string;
+  /** Working directory of the child. Defaults to the runtime package root. */
+  cwd?: string;
+  /** Extra env for the child. `undefined` as a value DELETES that variable. */
+  env?: Record<string, string | undefined>;
+  /** Text piped to the child's stdin (for `ingest`, `update -`, the hooks). */
+  stdin?: string;
+  /** Wall-clock ceiling; exceeding it is a harness failure, not a test result. */
+  timeoutMs?: number;
+}
+
+/**
+ * Spawn the REAL `src/cli.ts` as a child process and hand back what it did.
+ *
+ * WHY THIS EXISTS. Every op in this runtime is tested by calling it directly,
+ * and that is a lie of omission about a whole layer. `pullStore` is the clearest
+ * case: the suite only ever calls it with `skipGit: true`, so the git invocation
+ * the CLI actually issues — the argv, the cwd, whether a failure is even
+ * awaited — is executed by NOTHING in 989 passing tests. A defect that lives in
+ * dispatch (wrong verb wiring, a dropped `await`, an exit code that reports
+ * success for an operation that failed, an unhandled throw that dumps a Node
+ * stack where a hint belongs) is invisible from inside the process. That class
+ * has already shipped here once. The only way to see it is to be a different
+ * process and look at the exit code and the two streams, which is all this does.
+ *
+ * Isolation is enforced, not hoped for. The child inherits the vitest sandbox
+ * env, then GESTALT_HOME is REPLACED with this call's home, GESTALT_KEY and
+ * GESTALT_PASSPHRASE are cleared (a developer with either exported would
+ * otherwise unlock stores the test believes are locked), and the resolved home
+ * is asserted to live under GESTALT_TEST_ROOT before a process is spawned at
+ * all. Test code cannot reach the developer's real ~/.gestalt through here even
+ * by passing it deliberately.
+ */
+export function runCli(args: string[], opts: CliRunOptions = {}): CliRun {
+  const root = process.env.GESTALT_TEST_ROOT;
+  if (!root) throw new Error("test setup did not run (GESTALT_TEST_ROOT unset)");
+
+  const cli = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    GESTALT_HOME: opts.home ?? freshHome("cli-spawn"),
+    // Cleared, not sandboxed: a developer (or a CI box) with either of these
+    // exported would silently unlock stores a test believes are locked, and the
+    // test would pass here and fail for everyone else. Tests that WANT a key
+    // pass it through `env` explicitly.
+    GESTALT_KEY: "",
+    GESTALT_PASSPHRASE: "",
+    // The child's stdout is a pipe, so `useColor` is already false — but be
+    // explicit, because an assertion that fails only under FORCE_COLOR is the
+    // kind of flake nobody reproduces.
+    NO_COLOR: "1",
+  };
+  // Caller overrides land BEFORE the sandbox check, never after: `env` is a
+  // second route to GESTALT_HOME, and a guard that only inspected `opts.home`
+  // would wave through exactly the spelling that reaches the real store.
+  for (const [k, v] of Object.entries(opts.env ?? {})) {
+    if (v === undefined) delete env[k];
+    else env[k] = v;
+  }
+
+  const home = env.GESTALT_HOME ?? "";
+  const resolved = path.resolve(home);
+  if (
+    !home ||
+    (resolved !== path.resolve(root) &&
+      !resolved.startsWith(path.resolve(root) + path.sep))
+  ) {
+    // Deliberately a throw and not an assertion: a spawned CLI writes for real,
+    // and "the test failed" is the wrong outcome for "we were about to edit the
+    // developer's own store".
+    throw new Error(
+      `runCli refuses to spawn against ${resolved || "(no GESTALT_HOME)"}: it is ` +
+        `outside the test run-root ${root}. Pass a freshHome() path.`,
+    );
+  }
+
+  const timeout = opts.timeoutMs ?? 20_000;
+  const r = spawnSync(process.execPath, [tsxEntry(), cli, ...args], {
+    encoding: "utf8",
+    cwd: opts.cwd ?? fileURLToPath(new URL("..", import.meta.url)),
+    env,
+    input: opts.stdin ?? "",
+    timeout,
+    killSignal: "SIGKILL",
+    windowsHide: true,
+    // pack/export/brief can print more than spawnSync's 1 MB default, and a
+    // truncated stream would read as a product defect rather than a clipped buffer.
+    maxBuffer: 32 * 1024 * 1024,
+  });
+
+  if (r.error && (r.error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
+    throw new Error(
+      `runCli: \`${args.join(" ")}\` was still running after ${timeout}ms and was killed. ` +
+        "That is a hang in the CLI (or a prompt waiting on stdin), not a slow assertion.",
+    );
+  }
+  if (r.error) throw r.error;
+
+  return {
+    code: r.status ?? -1,
+    stdout: r.stdout ?? "",
+    stderr: r.stderr ?? "",
+    home,
+  };
 }

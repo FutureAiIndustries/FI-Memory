@@ -72,7 +72,7 @@ import { seedAfterInit } from "./ops/seed.js";
 import type { SeedResult } from "./ops/seed.js";
 import { SUPPORTERS_FILE, readSupporters } from "./ops/supporters.js";
 import { updateTopic } from "./ops/update.js";
-import { activateDek, clearActiveKey } from "./store/codec.js";
+import { activateDek, clearActiveKey, keyState } from "./store/codec.js";
 import {
   assertEnvKeyMatchesStore,
   keyringExists,
@@ -214,6 +214,8 @@ interface Args {
   new: boolean;
   allowOwnerNotes: boolean;
   clipboard: boolean;
+  /** `--machine <id>`: which clone's proposal, when two minted the same seq. */
+  machine?: string;
   /** Repeatable `--env KEY=VALUE` pairs (install-mcp). */
   envPairs: string[];
   /** Repeatable `--env-passthrough KEY` keys (install-mcp). */
@@ -246,6 +248,7 @@ function parseArgs(argv: string[]): Args {
     else if (arg === "--strict") a.strict = true;
     else if (arg === "--new") a.new = true;
     else if (arg === "--allow-owner-notes") a.allowOwnerNotes = true;
+    else if (arg === "--machine") a.machine = argv[++i];
     else if (arg === "--clipboard") a.clipboard = true;
     else if (arg === "-h" || arg === "--help") a.values["help"] = "1";
     else if (arg === "--version" || arg === "-v") a.values["version"] = "1";
@@ -1689,7 +1692,14 @@ async function main(argv: string[]): Promise<number> {
         }
         out();
         // Findings
-        if (r.findings.length === 0) out(c.green("  No findings — everything checks out."));
+        // "Everything checks out" means nothing is WRONG, not that nothing was said.
+  // Doctor now always emits an info-level finding (the CLI version, so a
+  // mixed-install bug report is diagnosable), which silently made this line
+  // unreachable — a healthy store stopped being told it was healthy. Judge the
+  // verdict on fail/warn only, and let info ride alongside it.
+  if (!r.findings.some((f) => f.level === "fail" || f.level === "warn")) {
+    out(c.green("  No problems found — everything checks out."));
+  }
         else {
           for (const f of r.findings) {
             const tag = f.level === "fail" ? c.red("FAIL") : f.level === "warn" ? c.yellow("warn") : c.dim("info");
@@ -2096,8 +2106,9 @@ async function runHookCapture(home: string, args: Args): Promise<number> {
     Number(args.values["budget-ms"] ?? 500) || 500,
   );
   // Soft unlock only — never Argon2 in the hook path.
+  let encrypted = false;
   try {
-    const encrypted = keyringExists(home) || storeHasSealedContent(home);
+    encrypted = keyringExists(home) || storeHasSealedContent(home);
     if (encrypted) {
       if (process.env.GESTALT_KEY) {
         try {
@@ -2125,6 +2136,18 @@ async function runHookCapture(home: string, args: Args): Promise<number> {
   } catch {
     /* fail open */
   }
+
+  // Act on the verdict. It used to be computed correctly and then discarded:
+  // `encrypted` was scoped to the try above, the comment three lines up said
+  // "locked — capture will skip", and capture ran anyway. On a sealed store we
+  // could not unlock, that meant writing PLAINTEXT notes, logs and proposals
+  // into a tree of ciphertext — and topics/ and proposals/ are not gitignored,
+  // so the next commit publishes them to the user's own remote, permanently.
+  //
+  // The real guard now lives in the codec (assertNotSealedStore keys on sealed
+  // CONTENT, not just keyring.json, which the store template gitignores). This
+  // is the second line of defence, and it also skips work that cannot land.
+  if (encrypted && keyState().mode !== "encrypted") return 0;
 
   let payload: Record<string, unknown> = {};
   try {
@@ -2323,7 +2346,7 @@ async function reviewCommand(args: Args, home: string): Promise<number> {
   }
 
   if (sub === "show") {
-    const doc = await reviewShow(home, seq);
+    const doc = await reviewShow(home, seq, args.machine);
     if (args.json) { out(JSON.stringify(doc, null, 2)); return 0; }
     out(c.b(`Suggested edit #${doc.seq} on "${doc.id}"`) + c.dim(`  (${doc.status}, by ${doc.proposer})`));
     const ownerChanged =
@@ -2337,18 +2360,23 @@ async function reviewCommand(args: Args, home: string): Promise<number> {
   }
 
   if (sub === "approve") {
-    const r = await reviewApprove(home, seq, { allowOwnerNotes: args.allowOwnerNotes });
+    const r = await reviewApprove(home, seq, {
+      allowOwnerNotes: args.allowOwnerNotes,
+      machineId: args.machine,
+    });
     out(c.green(`Approved #${seq} — "${r.id}" updated.`));
     return 0;
   }
 
   if (sub === "reject") {
-    const r = await reviewReject(home, seq);
+    const r = await reviewReject(home, seq, args.machine);
     out(`Rejected #${seq} on "${r.id}". Nothing changed.`);
     return 0;
   }
 
-  return usageError("review needs: list | show <N> | approve <N> | reject <N>");
+  return usageError(
+    "review needs: list | show <N> | approve <N> | reject <N>   (add --machine <id> when two clones minted the same N)",
+  );
 }
 
 function strip(noteText: string): string {

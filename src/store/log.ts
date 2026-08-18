@@ -166,7 +166,33 @@ export function parseLog(
     }
   }
   flush();
-  return { entries, warnings };
+  return { entries: sortEntries(entries), warnings };
+}
+
+/**
+ * Chronological order, restored on every parse.
+ *
+ * A union-merged log is OURS-then-THEIRS, not oldest-then-newest: git
+ * concatenates the two sides, so after two machines append to the same topic the
+ * file is genuinely out of timestamp order on disk. `get`'s log tail happened to
+ * be safe because it sorts for itself, but every other reader takes file order
+ * as chronological — `compact` folds `entries.slice(-N)` and would quietly drop
+ * the newest team fact while keeping an older local one.
+ *
+ * Sorting HERE rather than in each caller is the point: the invariant belongs to
+ * the parse, so a reader added later inherits it instead of having to know.
+ *
+ * The tiebreak on identical timestamps is deliberate and stable. Two machines
+ * can mint the same millisecond, and the two entries are genuinely different, so
+ * they must not be reordered arbitrarily between runs — a serialize that shuffles
+ * equal-timestamp entries would rewrite the file on every read-modify-write and
+ * manufacture git conflicts out of nothing.
+ */
+function sortEntries(entries: LogEntry[]): LogEntry[] {
+  return [...entries].sort((a, b) => {
+    if (a.timestamp !== b.timestamp) return a.timestamp < b.timestamp ? -1 : 1;
+    return a.raw < b.raw ? -1 : a.raw > b.raw ? 1 : 0;
+  });
 }
 
 /**
@@ -228,7 +254,11 @@ function parseEncryptedLog(
     }
     entries.push(parsed);
   }
-  return { entries, warnings: [] };
+  // Same invariant on the encrypted path. An encrypted log union-merges exactly
+  // like a plaintext one — the merge driver works on lines, not on plaintext —
+  // so it arrives out of order for the same reason and must not be the one
+  // shape of store where `compact` folds stale.
+  return { entries: sortEntries(entries), warnings: [] };
 }
 
 /**

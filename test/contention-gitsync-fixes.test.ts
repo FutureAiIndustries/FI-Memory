@@ -387,11 +387,29 @@ describe("contention: git-synced team store", () => {
     await writeFileAtomic(topicLogPath(home, topicId), serializeLog(topicId, [mid, newer, older]));
 
     const raw = await readText(topicLogPath(home, topicId));
+
+    // The hazard is REAL ON DISK: the physical order of the entry headers is
+    // not chronological, which is exactly what a union merge produces.
+    // Both shapes: a plaintext log is `### <ts> | ...`, a sealed one is
+    // `<ts> <base64url>` per line. The timestamp is in the clear either way,
+    // which is what makes a union merge possible on an encrypted store at all.
+    const ISO_AT_LINE_START = /^(?:### )?(\d{4}-\d{2}-\d{2}T[0-9:.]+Z)/gm;
+    const physical = [...raw!.matchAll(ISO_AT_LINE_START)].map((m) => m[1]!);
+    expect(physical.length, "fixture produced no readable timestamps").toBeGreaterThan(1);
+    const sortedPhysical = [...physical].sort();
+    expect(physical).not.toEqual(sortedPhysical);
+
+    // And the parse repairs it. This assertion used to be inverted — it pinned
+    // parseLog returning FILE order, which was the defect this test's own title
+    // describes ("recency is by timestamp, not file position"). W-E moved the
+    // guarantee into the parse, so every reader inherits it instead of each one
+    // having to sort for itself, and the test now asserts the property rather
+    // than the bug.
     const reparsed = parseLog(raw!, topicId).entries;
     const chronological = [...reparsed]
       .sort((a, b) => (a.timestamp < b.timestamp ? -1 : 1))
       .map((e) => e.timestamp);
-    expect(reparsed.map((e) => e.timestamp)).not.toEqual(chronological);
+    expect(reparsed.map((e) => e.timestamp)).toEqual(chronological);
 
     const g = await get(home, [topicId], { logTail: 1 });
     const tail = g.topics[0]?.logTail ?? "";

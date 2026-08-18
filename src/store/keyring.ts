@@ -20,6 +20,7 @@ import * as bip39 from "@scure/bip39";
 import { wordlist } from "@scure/bip39/wordlists/english.js";
 import { GestaltError } from "../errors.js";
 import { fsPath, storePaths } from "../paths.js";
+import { ENC_MAGIC } from "./wireFormat.js";
 import { wipeSessionCache } from "../sessionKeyCache.js";
 import type { WipeOutcome } from "../sessionKeyCache.js";
 import { activateDek, clearActiveKey, decodeLogEntry, decryptFile } from "./codec.js";
@@ -68,7 +69,6 @@ export const DEFAULT_ARGON2: Omit<Argon2Params, "salt"> = { name: "argon2id", m:
 const ARGON2_FLOOR = { m: 19456, t: 2 };
 const ARGON2_CEIL = { m: 1_048_576, t: 10, p: 4 };
 const KID_RE = /^[0-9a-f]{16}$/;
-const ENC_MAGIC = "gestalt-enc:1:";
 
 /**
  * Strip a leading BOM (U+FEFF) and any leading whitespace — for the magic
