@@ -7,10 +7,18 @@ import { isoFromMs, msFromIso, systemClock } from "../clock.js";
 import type { Clock } from "../clock.js";
 import { loadConfig } from "../config.js";
 import { insertionDiff } from "../diff.js";
+import { homeFlagFor } from "../followUp.js";
 import { GestaltError } from "../errors.js";
 import { sha256 } from "../hash.js";
 import { isValidId } from "../id.js";
-import { fsPath, proposalPath, storePaths, topicLogPath, topicNotePath } from "../paths.js";
+import {
+  fsPath,
+  proposalPath,
+  resolveHome,
+  storePaths,
+  topicLogPath,
+  topicNotePath,
+} from "../paths.js";
 import { writeFileAtomic, writeFileAtomicPlain } from "../store/atomic.js";
 import { decodeLedgerLine, decryptFile } from "../store/codec.js";
 import { withLock } from "../store/lock.js";
@@ -265,6 +273,8 @@ export interface MintedProposal {
   ownerNotesDiffer: boolean;
   /** The exact approve command, `--allow-owner-notes` included when needed. */
   approveCommand: string;
+  /** The exact `review show` command, carrying the same --home. */
+  showCommand: string;
 }
 
 /** One same-note conflict, resolved. */
@@ -488,7 +498,9 @@ export async function resolveConflicts(
     for (const plan of notePlans) {
       await writeFileAtomic(topicNotePath(home, plan.id), plan.winnerText);
       toAdd.push(plan.p.rel);
-      minted.push(plan.needsProposal ? await mintLoser(home, plan, now, toAdd) : null);
+      minted.push(
+        plan.needsProposal ? await mintLoser(home, plan, now, toAdd, homeFlagFor(home, env)) : null,
+      );
     }
 
     for (const plan of parkPlans) {
@@ -759,11 +771,13 @@ function proposedFrom(id: string, winnerNote: TopicNote, loserNote: TopicNote): 
  * called: it derives the next number by reading the proposals directory, and two
  * mints racing that read would collide on a filename.
  */
+
 async function mintLoser(
   home: string,
   plan: NotePlan,
   now: Clock,
   toAdd: string[],
+  homeFlag: string,
 ): Promise<MintedProposal> {
   const ownerNotesDiffer = !ownerNotesEqual(plan.winnerNote.body, plan.proposedNote.body);
 
@@ -818,8 +832,9 @@ async function mintLoser(
     // feature is for. Naming the machine costs nothing on a two-machine store
     // and is the difference between recoverable and stuck on a larger one.
     approveCommand:
-      `${BIN} review approve ${String(seq)} --machine ${machineId}` +
+      `${BIN} review approve ${String(seq)} --machine ${machineId}${homeFlag}` +
       (ownerNotesDiffer ? " --allow-owner-notes" : ""),
+    showCommand: `${BIN} review show ${String(seq)}${homeFlag}`,
   };
 }
 
@@ -1163,7 +1178,7 @@ function narrate(r: ResolveConflictsResult): string[] {
         ? `${n.path}: both machines held the same note; kept ${who} copy`
         : `${n.path}: kept ${who} version (updated ${n.winnerUpdated ?? "unknown"}` +
           `${n.tie ? ", tie" : ""}); filed the other as proposal #${String(n.proposal.seq)} — ` +
-          `read it with \`${BIN} review show ${String(n.proposal.seq)}\`, keep it with ` +
+          `read it with \`${n.proposal.showCommand}\`, keep it with ` +
           `\`${n.proposal.approveCommand}\``,
     );
   }

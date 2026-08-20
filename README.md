@@ -13,7 +13,7 @@ Nothing is uploaded anywhere.
 Two commands.
 
 ```
-npm i -g fimemory     # not published yet, private beta
+npm i -g fimemory
 fimemory setup
 ```
 
@@ -87,13 +87,18 @@ you which one you have.
 - **Automated Sync is not shipped.** Multi-machine works via your own git remote,
   under your own account. No Sync service exists yet, so nothing you write
   ever leaves your machine unless you configure a remote yourself.
-- **The shipped scope is one machine, several agents.** Team sync is not in it.
+- **The shipped scope is your machines, several agents.** Point two machines at
+  one private git remote: `fimemory join <url>` on the second machine, then
+  `fimemory pull` before and after sessions. Edits to the same note never
+  silently merge; the losing side becomes a pending proposal for you to review.
+  Team features beyond your own remote are not in it.
 
 ## What `setup` actually runs
 
 Five steps, in this order:
 
-1. `init`, only when there is no store at `~/.gestalt`. Skipped, never
+1. `init`, only when there is no store at `~/.fimemory` (an existing
+   `~/.gestalt` from an earlier install is detected and kept). Skipped, never
    overwritten, when one is already there.
 2. `install-mcp`, which writes the MCP server entry into each host config file
    it finds. This is what gives an assistant the ability to read the store.
@@ -142,7 +147,7 @@ Every other row in the table has been seen on disk.
 
 - **Claude Code** is the one host `install-mcp` does not write. The Claude Code
   CLI owns the schema of `~/.claude.json`, so we print
-  `claude mcp add gestalt -s user -- ...` instead. Its rule block and its hook
+  `claude mcp add fimemory -s user -- ...` instead. Its rule block and its hook
   are written for you.
 - **Cursor**: we write no Cursor rules file. Where Cursor keeps user-level
   rules, and whether it loads `~/.cursor/rules`, is **unverified**. Cursor is
@@ -257,15 +262,15 @@ reason with its source.
 
 `install-mcp` gives your assistant the ability to read the store.
 `install-rules --mode shim` is what makes it read the store *without being
-asked*, by injecting the relevant notes ahead of your prompt. On our own
-15-question measurement that shim answered 14/15 for 39% less cost than letting
-the assistant search the store through tool calls. Without it, the tools are
-present and mostly idle.
+asked*, by injecting the relevant notes ahead of your prompt. In our own
+measurements that costs a fraction of what letting the assistant search the
+store through tool calls costs. Without it, the tools are present and mostly
+idle.
 
 The shim wording is written only into a file that is read *exclusively* by hosts
 where the retrieval hook actually runs, which today means Claude Code on a
 machine without Grok CLI. Every other file gets the search-first block instead,
-the wording that tells those assistants to call `gestalt_search` themselves,
+the wording that tells those assistants to call `fimemory_search` themselves,
 since nothing is injected for them. Install Grok CLI and `~/.claude/CLAUDE.md`
 drops back to the search-first wording on the next `setup`, because Grok reads
 that file too.
@@ -320,11 +325,11 @@ commands and the whole back-out stays on one screen.
 same hosts, same files, same rule that a host's config directory decides whether
 it is installed. It deletes our entry and nothing else. A config it cannot parse
 is refused and left byte-identical rather than rewritten, and refusing is exit 1,
-so `fimemory uninstall-mcp && rm -rf ~/.gestalt` stops instead of continuing.
+so `fimemory uninstall-mcp && rm -rf ~/.fimemory` stops instead of continuing.
 A host with nothing of ours in it is a success and exits 0.
 
 Claude Code is symmetric with the install: we print
-`claude mcp remove gestalt -s user` and read `~/.claude.json` read-only, purely
+`claude mcp remove fimemory -s user` and read `~/.claude.json` read-only, purely
 to tell you whether an entry is registered there.
 
 ### Passphrase ordering, before you remove anything
@@ -346,7 +351,8 @@ directions:
   those values with it too.
 
 The store itself is your folder, so removing it is removing a directory:
-`~/.gestalt`, or wherever you pointed `--home`. Export first if you want to
+`~/.fimemory` (or `~/.gestalt` on an install that predates the rename), or
+wherever you pointed `--home`. Export first if you want to
 keep the notes.
 
 ## Your files, your exit
@@ -357,9 +363,10 @@ works on day one.
 
 ## Naming note
 
-The MCP server key, the tool ids (`gestalt_*`), and the store path
-(`~/.gestalt`) keep the runtime's internal name. That is deliberate: renaming
-the measured tool surface is a separate, re-baselined change.
+Everything user-facing is `fimemory`: the command, the MCP server key, and the
+tool ids (`fimemory_search`, `fimemory_get`, ...). Installs that predate the
+rename keep working: a store at `~/.gestalt`, `GESTALT_*` environment
+variables, and an old `gestalt` MCP entry are all still detected and honoured.
 
 ## License
 

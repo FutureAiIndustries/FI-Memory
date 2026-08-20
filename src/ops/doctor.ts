@@ -10,6 +10,7 @@ import {
   readEnv,
 } from "../brand.js";
 import { loadConfig } from "../config.js";
+import { followUp } from "../followUp.js";
 import { fsPath, storePaths } from "../paths.js";
 import { peekSessionCache } from "../sessionKeyCache.js";
 import type { SessionCachePeek } from "../sessionKeyCache.js";
@@ -1366,7 +1367,9 @@ export function runDoctor(opts: DoctorOptions = {}): DoctorReport {
         code: "seed_review_pending",
         message:
           "The suggested edit pre-staged at install is still waiting — the approve flow (the product's trust model) has never been exercised.",
-        hint: `Run \`${BIN} review show 1\`, then \`${BIN} review approve 1\` or \`reject 1\` — one loop, once.`,
+        hint:
+          `Run \`${followUp(home, "review show 1")}\`, then ` +
+          `\`${followUp(home, "review approve 1")}\` or \`${followUp(home, "review reject 1")}\` — one loop, once.`,
       });
     }
     if (

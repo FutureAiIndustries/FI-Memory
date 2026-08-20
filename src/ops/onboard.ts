@@ -1,5 +1,6 @@
 import { BIN, PRODUCT } from "../brand.js";
 import { GestaltError } from "../errors.js";
+import { followUp } from "../followUp.js";
 import { listProposals } from "../store/proposals.js";
 import { appendLog } from "./logOp.js";
 import { createTopic } from "./create.js";
@@ -161,7 +162,10 @@ export function remainingSteps(r: DoctorReport): string[] {
   }
   const ct = r.content;
   if (ct.assessed && ct.seedProposalPending) {
-    steps.push(`${BIN} review show 1    # then: ${BIN} review approve 1 (or reject 1) — run the trust loop once`);
+    steps.push(
+      `${followUp(r.home, "review show 1")}    # then: ` +
+        `${followUp(r.home, "review approve 1")} (or reject 1) — run the trust loop once`,
+    );
   }
   if (ct.assessed && !ct.hasUserContent) {
     steps.push(`${BIN} onboard    # interactive: puts your first real facts in the store`);
@@ -291,7 +295,9 @@ export async function runOnboard(opts: OnboardOptions, io: OnboardIO): Promise<O
         io.out("Rejected — the note stays as it was; the proposal is closed. Also a completely valid run of the loop.");
       } else {
         result.review = "later";
-        io.out(`Left waiting — \`${BIN} review show ${doc.seq}\` when you are ready.`);
+        io.out(
+          `Left waiting — \`${followUp(home, `review show ${doc.seq}`)}\` when you are ready.`,
+        );
       }
     }
   } catch (err) {

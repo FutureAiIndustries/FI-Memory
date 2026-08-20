@@ -111,16 +111,28 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "fimemory_log",
+    // STATE THE LIMIT BEFORE THE CALLER COMPOSES, not after we reject them.
+    //
+    // This used to end "so log freely" and never mention a cap. An agent reads
+    // that, writes a thorough entry, and is refused by a number it had no way to
+    // see — then trims and is refused again. Two agents burned eleven and five
+    // round trips on single entries on 2026-08-18. The product was teaching the
+    // behaviour it then punished, and the word doing the damage was "freely".
+    //
+    // The neighbouring create tool has always documented its limits exactly
+    // ("2–64 characters", "up to 120 characters"); this one simply did not.
+    // 350 tokens is the default entryTokenCap and is named as a default, since a
+    // store may raise it.
     description:
-      "Append a typed changelog entry as you learn something — decision · pattern · gotcha · convention · supersede. Cheap, additive, and safe: logging never changes the curated note, so log freely.",
+      "Append a typed changelog entry as you learn something — decision · pattern · gotcha · convention · supersede. Logging never changes the curated note, so log often — but keep each entry under ~1,400 characters (the store's entryTokenCap, 350 tokens by default); longer entries are REJECTED. Split a long finding into two entries rather than trimming it to fit.",
     inputSchema: {
       type: "object",
       properties: {
         id: { type: "string" },
         type: { type: "string", enum: ["decision", "pattern", "gotcha", "convention", "supersede"] },
         project: { type: "string" },
-        summary: { type: "string", description: "One line (required)." },
-        body: { type: "string", description: "Optional detail." },
+        summary: { type: "string", description: "One line (required). Counts toward the ~1,400 character entry limit." },
+        body: { type: "string", description: "Optional detail. Summary + body must total under ~1,400 characters." },
         supersedes: { type: "string", description: "Timestamp of an entry this supersedes." },
         refs: {
           type: "array",

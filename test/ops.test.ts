@@ -113,6 +113,56 @@ describe("log", () => {
     );
   });
 
+  /**
+   * The rejection has to CONVERGE, not merely inform.
+   *
+   * Naming the overage in tokens plus an estimated word count still left callers
+   * descending: 489, 450, 435, 423, 412, 399, 387, 375, 362, 353, 351, 350
+   * against a cap of 350 on 2026-08-18 — eleven round trips, the last four
+   * missing by single digits. A word figure is a guess about prose, and a caller
+   * asked to shorten REWRITES, which re-inflates.
+   *
+   * So this asserts the property rather than the wording: cut exactly the number
+   * of characters the error asks for, and the retry passes. First time, by
+   * arithmetic. If someone later replaces the character figure with another
+   * estimate, this fails.
+   */
+  it("cutting exactly the characters the error names passes on the FIRST retry", async () => {
+    const home = await withTopic();
+    const summary = "y".repeat(3000);
+
+    let message = "";
+    try {
+      await appendLog(home, "topic-a", { ...base, summary });
+      throw new Error("expected E_TOKEN_CAP");
+    } catch (e) {
+      message = e instanceof Error ? e.message : String(e);
+    }
+
+    const m = /Cut (\d+) characters/.exec(message);
+    expect(m, `error should name an exact character count, got: ${message}`).not.toBeNull();
+    const cut = Number(m![1]);
+    expect(cut).toBeGreaterThan(0);
+
+    // Follow the advice literally, removing not one character more.
+    await appendLog(home, "topic-a", { ...base, summary: summary.slice(0, summary.length - cut) });
+
+    const log = await readText(topicLogPath(home, "topic-a"));
+    expect(log).toContain("y".repeat(50));
+  });
+
+  it("the cap error reports characters, since tokens and words could not converge", async () => {
+    const home = await withTopic();
+    let message = "";
+    try {
+      await appendLog(home, "topic-a", { ...base, summary: "z".repeat(3000) });
+    } catch (e) {
+      message = e instanceof Error ? e.message : String(e);
+    }
+    expect(message).toMatch(/\d+ characters/);
+    expect(message).toMatch(/the cap is \d+ tokens \/ \d+ characters/);
+  });
+
   it("anti-forgery (fake header in body) → E_SCHEMA", async () => {
     const home = await withTopic();
     await expectGestaltErrorAsync(

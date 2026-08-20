@@ -7,13 +7,13 @@ import {
   writeFileSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { readEnv } from "../brand.js";
+import { BIN, readEnv } from "../brand.js";
 import path from "node:path";
 import { GestaltError } from "../errors.js";
 import { resolveHome, storePaths } from "../paths.js";
 import { runDoctor } from "./doctor.js";
 import { installRules } from "./installRules.js";
-import { installHooks } from "./installHooks.js";
+import { checkShimHooks, installHooks } from "./installHooks.js";
 import { reindexStore } from "./reindexOp.js";
 import {
   keyringExists,
@@ -45,6 +45,28 @@ export interface JoinOptions {
   gitClone?: (url: string, dest: string) => { ok: boolean; message: string };
   /** When true, also install retrieve hooks (default true for shim mode). */
   installHooks?: boolean;
+  /**
+   * Rewrite the machine's rules file. Default true.
+   *
+   * Users had no way to say no. `rulesFile` existed, but only to redirect the
+   * write somewhere harmless in tests — the write itself was unconditional.
+   */
+  installRules?: boolean;
+  /**
+   * Rewire this machine even when its hooks currently point at a DIFFERENT
+   * store. Default false, which is the whole point: see the guard below.
+   */
+  forceRewire?: boolean;
+  /**
+   * Claude settings.json to read the existing wiring from, and to write hooks
+   * to. Default: the real `~/.claude/settings.json`.
+   *
+   * Injectable for the same reason `rulesFile` is: the rewire guard reads the
+   * machine's CURRENT wiring, so without this a test inherits whatever the
+   * developer's box happens to be wired to and join behaves differently on
+   * every machine it runs on.
+   */
+  settingsPath?: string;
   /**
    * Rules file to write. Default: the host default (`~/.claude/CLAUDE.md`).
    *
@@ -287,20 +309,48 @@ export async function joinStore(opts: JoinOptions): Promise<JoinResult> {
   }
 
   // ── 6. install-rules + hooks ──────────────────────────────────────────────
-  let rulesPath: string | null = null;
-  try {
-    const rules = await installRules({
-      mode: "shim",
-      ...(opts.rulesFile !== undefined ? { file: opts.rulesFile } : {}),
-    });
-    rulesPath = rules.path;
-    steps.push(`install-rules mode=shim → ${rules.path} (${rules.action})`);
-  } catch (err) {
-    warnings.push(`install-rules failed: ${err instanceof Error ? err.message : String(err)}`);
+  //
+  // JOIN USED TO REWIRE THE MACHINE UNCONDITIONALLY, and that is how you lose a
+  // tester's memory. On a box that already has a working store, rewriting the
+  // rules file and repointing the hooks makes every AI tool read the store you
+  // just joined. No error, no prompt; the symptom is "my memory went empty",
+  // which reads as data loss. Found on a real machine in the 2026-08-18
+  // two-machine gate — the wiring had been hash-backed up beforehand and was
+  // restored from that backup.
+  //
+  // So: joining a SECOND store never steals the first. Wiring happens when the
+  // machine has none, or when it already points here, or when asked outright.
+  const wiredHome = currentlyWiredHome(opts.settingsPath);
+  const pointsElsewhere = wiredHome !== null && path.resolve(wiredHome) !== path.resolve(home);
+  const rewire = opts.forceRewire === true || !pointsElsewhere;
+  if (!rewire) {
+    steps.push(`left this machine's AI wiring alone — it points at ${wiredHome ?? "another store"}`);
+    warnings.push(
+      `This machine's AI tools are wired to ${wiredHome ?? "another store"}, so join did NOT ` +
+        `repoint them at ${home}. The store is cloned and ready either way. To switch this ` +
+        `machine over deliberately: ${BIN} join <url> --home ${home} --force-rewire`,
+    );
   }
-  if (opts.installHooks !== false) {
+
+  let rulesPath: string | null = null;
+  if (rewire && opts.installRules !== false) {
     try {
-      const hr = await installHooks({ home });
+      const rules = await installRules({
+        mode: "shim",
+        ...(opts.rulesFile !== undefined ? { file: opts.rulesFile } : {}),
+      });
+      rulesPath = rules.path;
+      steps.push(`install-rules mode=shim → ${rules.path} (${rules.action})`);
+    } catch (err) {
+      warnings.push(`install-rules failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (rewire && opts.installHooks !== false) {
+    try {
+      const hr = await installHooks({
+        home,
+        ...(opts.settingsPath !== undefined ? { settingsPath: opts.settingsPath } : {}),
+      });
       steps.push(`install-hooks ${hr.action} → ${hr.path}`);
     } catch (err) {
       warnings.push(`install-hooks failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -330,4 +380,24 @@ export async function joinStore(opts: JoinOptions): Promise<JoinResult> {
     warnings,
     reindexed,
   };
+}
+
+/**
+ * The store this machine's hooks currently read, or null if it has none.
+ *
+ * Read from the installed handler's own argv rather than from any config we
+ * keep, because the handler's argv is what actually runs on every prompt — a
+ * record that disagrees with it would be the thing lying to us.
+ */
+function currentlyWiredHome(settingsPath?: string): string | null {
+  let check: ReturnType<typeof checkShimHooks>;
+  try {
+    check = checkShimHooks(settingsPath !== undefined ? { settingsPath } : {});
+  } catch {
+    return null;
+  }
+  if (!check.written || !check.args) return null;
+  const i = check.args.indexOf("--home");
+  const val = i >= 0 ? check.args[i + 1] : undefined;
+  return val !== undefined && val.trim() !== "" ? val : null;
 }

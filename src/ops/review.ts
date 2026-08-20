@@ -1,3 +1,5 @@
+import { BIN } from "../brand.js";
+import { dirty, isRepo } from "./gitState.js";
 import { isoFromMs, msFromIso, nextMonotonic, systemClock } from "../clock.js";
 import type { Clock } from "../clock.js";
 import { loadConfig } from "../config.js";
@@ -158,6 +160,25 @@ export async function reviewApprove(
     // Fixed auto-entry — appended exactly once (idempotent on resume).
     const { entries } = parseLog(preLog, id);
     const summary = `Note updated via proposal #${seq} by ${doc.proposer}.`;
+    // Approving a MERGE-AUTHORED proposal flips which side of a conflict is
+    // live, and the side it replaces was the merge's winner — which nothing
+    // else preserves. The merge excerpts the side it FILES; without this, the
+    // side it KEPT vanishes from search the moment you approve the other one.
+    // Round trip on 2026-08-18: kingfisher ended up preserved twice, albatross
+    // nowhere, and only doing both halves exposed it.
+    //
+    // Scoped to merge-authored proposals ON PURPOSE. The everyday loop is
+    // update -> approve, and echoing superseded prose into the log there would
+    // fill search with text the user deliberately replaced — a worse bug,
+    // arriving slowly enough that nobody would attribute it. There is a
+    // principled line too: in an ordinary approve a human SAW the diff and
+    // chose; in a merge a machine discarded a side nobody ever looked at.
+    const supersededBody = mergeSupersedeExcerpt(
+      doc.proposer,
+      baseNote.body,
+      newNote.body,
+      config.entryTokenCap,
+    );
     let finalLog = preLog;
     if (!entries.some((e) => e.summary === summary)) {
       const autoTs = isoFromMs(nextMonotonic(now(), lastMs));
@@ -170,11 +191,13 @@ export async function reviewApprove(
         reported: null,
         refs: null,
         summary,
+        ...(supersededBody !== null ? { body: supersededBody } : {}),
         raw: formatEntryBlock(autoTs, {
           type: "decision",
           project: "gestalt",
           agent: "gestalt-runtime",
           summary,
+          ...(supersededBody !== null ? { body: supersededBody } : {}),
         }),
       };
       finalLog = serializeLog(id, [...entries, auto]);
@@ -196,7 +219,7 @@ export async function reviewApprove(
       }
     }
 
-    return { id, warnings: [] };
+    return { id, warnings: unsharedMergeWarning(home, doc.proposer) };
   });
 }
 
@@ -224,4 +247,62 @@ function notFoundProposal(seq: number): GestaltError {
 }
 function unparsableProposal(seq: number): GestaltError {
   return new GestaltError("E_SCHEMA", `Proposal #${seq} is unparsable.`, "fimemory review list");
+}
+
+/**
+ * An excerpt of the note body an approve is about to discard, or null when
+ * nothing should be recorded.
+ *
+ * Returns non-null only for a proposal the MERGE wrote. See the call site for
+ * why this must not fire on the ordinary update -> approve path.
+ */
+function mergeSupersedeExcerpt(
+  proposer: string,
+  replacedBody: string,
+  incomingBody: string,
+  entryTokenCap: number,
+): string | null {
+  if (proposer !== `${BIN}-pull`) return null;
+  const flat = replacedBody.replace(/\s+/g, " ").trim();
+  if (flat === "") return null;
+  if (flat === incomingBody.replace(/\s+/g, " ").trim()) return null;
+  // Same shape as the merge's own line so both halves of a conflict read alike.
+  const label = "Superseded version, excerpted here so search can still find it: ";
+  const room = entryTokenCap * 4 - label.length - 80;
+  if (room <= 1) return null;
+  const excerpt = flat.length <= room ? flat : `${flat.slice(0, room - 1).trimEnd()}…`;
+  return label + excerpt;
+}
+
+/**
+ * Warn when approving a conflict resolution leaves it sitting in a dirty tree.
+ *
+ * pull already says "local commits not yet shared" — but it says it BEFORE you
+ * approve anything, and approving re-dirties the store with nothing to remind
+ * you. On 2026-08-18 that is exactly what happened: pull's reminder was
+ * followed, the push ran, then the approve dirtied three files again and the
+ * resolution would have stayed local. Two machines then read as "merged" while
+ * still disagreeing, which is the failure pull's reminder exists to prevent.
+ *
+ * Scoped to merge-authored proposals for the same reason the supersede excerpt
+ * is: on the everyday update -> approve loop an uncommitted store is normal and
+ * harmless, and a reminder on every approve is noise nobody reads. It is only
+ * load-bearing when the thing left behind is a cross-machine resolution.
+ */
+function unsharedMergeWarning(home: string, proposer: string): Warning[] {
+  if (proposer !== `${BIN}-pull`) return [];
+  try {
+    if (!isRepo(home)) return [];
+    if (dirty(home).length === 0) return [];
+  } catch {
+    return [];
+  }
+  return [
+    {
+      code: "W_MERGE_NOT_SHARED",
+      message:
+        `You resolved a cross-machine conflict, and it is only on this machine until ` +
+        `you share it. Commit and push ${home}, or the other machine will still disagree.`,
+    },
+  ];
 }

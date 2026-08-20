@@ -220,7 +220,13 @@ const B_BETA_APPROVE = T0 + 401_000;
 const RESOLVE_AT = T0 + 900_000;
 
 /** Distinctive words that exist on exactly one machine's side of one note. */
-const A_ALPHA_LINE = "Machine A on alpha: the marmalade budget doubled this quarter.";
+// "albatross" on purpose: one of the two words from the live 2026-08-18
+// two-machine run, and it contains an s. A /s+/ typo in the supersede excerpt
+// mangled every word containing an s and this test still passed — the word it
+// searched for, the old "marmalade", was the one word in the sentence immune to
+// the bug. A fixture that cannot express the failure is worth as little as a
+// denylist that cannot name the character.
+const A_ALPHA_LINE = "Machine A on alpha: the albatross budget doubled this quarter.";
 const B_ALPHA_LINE = "Machine B on alpha: the quokka telemetry seam is load-bearing.";
 const A_BETA_LINE = "Machine A on beta: the kingfisher rollout is paused indefinitely.";
 const B_BETA_LINE = "Machine B on beta: the pangolin index is authoritative from now on.";
@@ -1239,6 +1245,110 @@ async function sealedStateConflict(q: Pair): Promise<void> {
  *
  * So the collision is CONSTRUCTED. Nothing here depends on arithmetic.
  */
+/**
+ * THE ROUND TRIP — the property, not the mechanism.
+ *
+ * The merge half was never broken: it excerpts the side it FILES, and a test
+ * asserting "the merge wrote an excerpt" passes today. What that test cannot
+ * see is what happens NEXT. Approving the filed proposal flips which side is
+ * live, and the side it replaces — the merge's WINNER — had nothing preserving
+ * it. Net effect on a real two-machine run: one phrase preserved twice, the
+ * other reachable only by someone willing to run a plaintext export.
+ *
+ * Found on live machines 2026-08-18, by doing both halves. Neither machine saw
+ * it doing one. So this asserts the user-visible property — both phrases
+ * findable after the full trip — because that is the only shape of test that
+ * would have caught it.
+ */
+describe("round trip: approving a merge-filed proposal keeps BOTH sides findable", () => {
+  let p: Pair;
+  let filedSeq: number;
+
+  beforeAll(async () => {
+    clearActiveKey();
+    p = await buildPair("wd-roundtrip", false);
+    await dualApprove(p);
+
+    const pulled = rawPull(p, p.b);
+    expect(pulled.ok).toBe(false); // git alone cannot do this; that is the point
+
+    const res = await resolveConflicts(p.b, { env: p.env, now: clockAt(RESOLVE_AT) });
+    git(p, p.b, "commit", "-q", "--no-edit");
+    filedSeq = res.notes.find((n) => n.id === "alpha")!.proposal!.seq;
+    await reindexStore(p.b);
+  }, 120_000);
+
+  it("before approving: the filed side is findable, and so is the live one", async () => {
+    expect((await search(p.b, "quokka")).hits.map((h) => h.id)).toContain("alpha");
+    expect((await search(p.b, "albatross")).hits.map((h) => h.id)).toContain("alpha");
+  }, 60_000);
+
+  it("after approving the filed side, the side it REPLACED is still findable", async () => {
+    // Live body before the flip is machine A's line; approving installs B's.
+    expect(await liveBody(p.b, "alpha")).toContain(A_ALPHA_LINE);
+
+    const approved = await reviewApprove(p.b, filedSeq, { now: clockAt(RESOLVE_AT + 60_000) });
+
+    // Approving a MERGE-authored proposal leaves the resolution in a dirty tree,
+    // and pull's own "not yet shared" reminder fired long before this point. Two
+    // machines then read as merged while still disagreeing — the exact failure
+    // that reminder exists to prevent. So the warning must be here.
+    //
+    // Asserted on the RETURN VALUE deliberately: the CLI shipped for a while
+    // computing this and throwing it away, because the approve branch was the
+    // one call site of fourteen that never rendered r.warnings. A test that only
+    // proves the ops layer is not enough on its own — but it is the half that
+    // belongs here, and it fails loudly if the warning itself regresses.
+    expect(approved.warnings.map((w) => w.code)).toContain("W_MERGE_NOT_SHARED");
+    expect(approved.warnings[0]?.message).toMatch(/only on this machine/i);
+
+    await reindexStore(p.b);
+
+    // The flip happened...
+    expect(await liveBody(p.b, "alpha")).toContain(B_ALPHA_LINE);
+    expect(await liveBody(p.b, "alpha")).not.toContain(A_ALPHA_LINE);
+
+    // ...and BOTH phrases survive it. "albatross" is the one that used to
+    // vanish here: it was live, it got replaced, and nothing recorded it.
+    expect((await search(p.b, "quokka")).hits.map((h) => h.id)).toContain("alpha");
+    expect((await search(p.b, "albatross")).hits.map((h) => h.id)).toContain("alpha");
+
+    // Assert the excerpt TEXT, not only that a search hits. A search fails only
+    // if the query word happens to be affected; this fails on ANY mangling,
+    // which is exactly what a one-character regex typo produced.
+    await exportPlaintext(p.b, path.join(p.root, "rt-export"));
+    const logText = readFileSync(
+      fsPath(path.join(p.root, "rt-export", "logs", "alpha.log.md")),
+      "utf8",
+    );
+    expect(logText).toContain("Superseded version");
+    expect(logText).toContain(A_ALPHA_LINE);
+  }, 60_000);
+
+  it("an ORDINARY approve does not echo superseded prose into the log", async () => {
+    // The everyday update -> approve loop must stay clean. Mirroring the merge
+    // behaviour here would fill search with text the user deliberately
+    // replaced — worse than the bug being fixed, and slower to notice.
+    const before = (await logSummaries(p.b, "beta")).length;
+    const cur = (await readText(topicNotePath(p.b, "beta")))!;
+    const seq = (
+      await updateTopic(p.b, "beta", editBody(cur, "an ordinary human edit about wombats"), {
+        proposer: "a-human",
+        now: clockAt(RESOLVE_AT + 120_000),
+      })
+    ).seq;
+    await reviewApprove(p.b, seq, { now: clockAt(RESOLVE_AT + 180_000) });
+    await reindexStore(p.b);
+
+    const after = await logSummaries(p.b, "beta");
+    expect(after.length).toBe(before + 1);
+    expect(after.some((x) => x.toLowerCase().includes("superseded version"))).toBe(false);
+    // The replaced words are gone from search, which is CORRECT: a human saw
+    // the diff and chose to discard them.
+    expect(await liveBody(p.b, "beta")).toContain("wombats");
+  }, 60_000);
+});
+
 describe("colliding proposal seqs across machines", () => {
   it("refuse a bare lookup, and each is reachable by the machine that minted it", async () => {
     const home = freshHome("seq-collision");

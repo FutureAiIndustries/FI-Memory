@@ -312,7 +312,22 @@ export async function pullStore(opts: PullOptions = {}): Promise<PullResult> {
     }
 
     pulled = true;
-    steps.push(`git pull: ${gitMessage}`);
+    // Do not hand a user git's raw collision text once the resolver has already
+    // dealt with it. Verbatim it reads:
+    //
+    //   CONFLICT (add/add): Merge conflict in topics/wn-topic.md
+    //   Automatic merge failed; fix conflicts and then commit the result.
+    //
+    // Both sentences are true of git and false of what just happened, and they
+    // appear ABOVE the line explaining the resolution, so the report tells you
+    // it failed and then that it worked. A first-timer stops at the first one.
+    // The raw text stays on `gitMessage` for --json and bug reports; only the
+    // human-facing line is reframed.
+    steps.push(
+      resolvedConflicts
+        ? `git pull: both machines had changed the same note; git could not merge it and the resolution above was applied instead`
+        : `git pull: ${gitMessage}`,
+    );
 
     // A merge commit lives only here until somebody pushes it. There is no
     // `fimemory push` and that is fine, but silence here is how two machines

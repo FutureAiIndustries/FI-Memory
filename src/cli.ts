@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { BIN, PRODUCT, passphraseExample, readEnv } from "./brand.js";
+import { followUp } from "./followUp.js";
 import { clipboardHint, copyToClipboardDetailed, readClipboardDetailed } from "./clipboard.js";
 import { insertionDiff } from "./diff.js";
 import { GestaltError } from "./errors.js";
@@ -181,7 +182,10 @@ Connect an AI tool (\`setup\` runs all of these for you):
                                --on: the exact inverse.
   hook-retrieve                Pure-stdout hook entry (stdin JSON → additionalContext); fail-open
   hook-capture                 SessionEnd capture (stdin JSON + transcript_path → worklog proposal); fail-open
-  join <git-url> [--keyring f] Clone a shared encrypted store; import keyring OOB, reindex, install-rules, doctor
+  join <git-url> [--keyring f] Clone a shared encrypted store; import keyring OOB, reindex, doctor.
+                               Wires this machine's AI tools to it ONLY if they are not already
+                               wired to a different store — joining a second store never steals
+                               the first. [--no-rules] [--no-hooks] [--force-rewire]
   pull                         git pull the store remote, then reindex (refreshes catalog + watermark)
 
 Maintenance:
@@ -1150,7 +1154,7 @@ async function main(argv: string[]): Promise<number> {
           ...(args.values["proposer"] ? { proposer: args.values["proposer"] } : {}),
         });
         if (args.json) out(JSON.stringify(r, null, 2));
-        else out(c.green(`Suggested edit #${r.seq} on "${id}" is waiting for your ok: fimemory review show ${r.seq}`));
+        else out(c.green(`Suggested edit #${r.seq} on "${id}" is waiting for your ok: ${followUp(homePath, `review show ${r.seq}`)}`));
         renderWarnings(r.warnings);
         return 0;
       }
@@ -1994,6 +1998,13 @@ async function main(argv: string[]): Promise<number> {
             // --skip-clone is for tests / already-cloned trees only.
             skipClone: args.values["skip-clone"] === "1",
             keyringFile: args.values["keyring"],
+            // Joining a second store must never silently steal the first. The
+            // opt-outs exist because joinStore has always accepted them and the
+            // CLI simply never passed them, so from a terminal there was no way
+            // to say "clone it, leave my tools alone".
+            ...(args.values["no-rules"] === "1" ? { installRules: false } : {}),
+            ...(args.values["no-hooks"] === "1" ? { installHooks: false } : {}),
+            ...(args.values["force-rewire"] === "1" ? { forceRewire: true } : {}),
           });
           if (args.json) {
             out(JSON.stringify(r, null, 2));
@@ -2339,7 +2350,7 @@ async function reviewCommand(args: Args, home: string): Promise<number> {
     if (args.json) { out(JSON.stringify(rows, null, 2)); return 0; }
     const pending = rows.filter((r) => r.status === "pending");
     if (pending.length === 0) out("No suggested edits waiting.");
-    for (const r of pending) out(`  ${c.b("#" + r.seq)} on ${r.id} ${c.dim(`by ${r.proposer}`)}  — fimemory review show ${r.seq}`);
+    for (const r of pending) out(`  ${c.b("#" + r.seq)} on ${r.id} ${c.dim(`by ${r.proposer}`)}  — ${followUp(home, `review show ${r.seq}`)}`);
     const others = rows.filter((r) => r.status !== "pending");
     if (others.length) out(c.dim(`\n${others.length} resolved (approved/rejected/outdated).`));
     return 0;
@@ -2355,7 +2366,12 @@ async function reviewCommand(args: Args, home: string): Promise<number> {
     out();
     out(insertionDiff(doc.oldNote, doc.newNote, "current", "suggested").trimEnd());
     out();
-    out(c.dim(`Apply: fimemory review approve ${doc.seq}${ownerChanged ? " --allow-owner-notes" : ""}   ·   Discard: fimemory review reject ${doc.seq}`));
+    out(
+      c.dim(
+        `Apply: ${followUp(home, `review approve ${doc.seq}${ownerChanged ? " --allow-owner-notes" : ""}`)}` +
+          `   ·   Discard: ${followUp(home, `review reject ${doc.seq}`)}`,
+      ),
+    );
     return 0;
   }
 
@@ -2365,6 +2381,13 @@ async function reviewCommand(args: Args, home: string): Promise<number> {
       machineId: args.machine,
     });
     out(c.green(`Approved #${seq} — "${r.id}" updated.`));
+    // reviewApprove has always returned warnings and this path always dropped
+    // them, so the post-approve "your resolution is only on this machine"
+    // reminder was computed and thrown away — dead code from the user's side.
+    // Caught on the shipping build during the ship gate, by watching the actual
+    // terminal output instead of trusting the unit test on the ops function.
+    // A fix verified one layer below the one people use is not verified.
+    renderWarnings(r.warnings);
     return 0;
   }
 

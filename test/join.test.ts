@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync, existsSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -53,6 +53,115 @@ function scratchRulesFile(label: string): string {
 }
 
 describe("join <git-url> — team playbook join flow", () => {
+  it("joining a SECOND store does not steal the first machine's wiring", async () => {
+    const { remote } = fixtureRemoteStore();
+    const dest = freshHome("join-guard-dest");
+    const rulesFile = scratchRulesFile("guard");
+
+    // A machine already wired to some OTHER store.
+    const otherStore = freshHome("join-guard-existing-store");
+    const settingsPath = path.join(freshHome("join-guard-settings"), "settings.json");
+    mkdirSync(path.dirname(settingsPath), { recursive: true });
+    writeFileSync(
+      settingsPath,
+      JSON.stringify({
+        hooks: {
+          UserPromptSubmit: [
+            {
+              hooks: [
+                {
+                  type: "command",
+                  command: "node",
+                  args: ["/somewhere/cli.js", "hook-retrieve", "--shim-id", "fimemory-v1", "--home", otherStore],
+                },
+              ],
+            },
+          ],
+        },
+      }),
+      "utf8",
+    );
+
+    const r = await joinStore({
+      gitUrl: remote,
+      home: dest,
+      env: {} as NodeJS.ProcessEnv,
+      rulesFile,
+      settingsPath,
+    });
+
+    // The store still arrives — refusing to rewire is not refusing to join.
+    expect(r.cloned).toBe(true);
+    expect(r.storeShapeOk).toBe(true);
+    // But nothing about this machine's existing setup was touched.
+    expect(r.rulesPath).toBe(null);
+    expect(existsSync(rulesFile)).toBe(false);
+    expect(JSON.parse(readFileSync(settingsPath, "utf8"))).toEqual(
+      JSON.parse(
+        JSON.stringify({
+          hooks: {
+            UserPromptSubmit: [
+              {
+                hooks: [
+                  {
+                    type: "command",
+                    command: "node",
+                    args: ["/somewhere/cli.js", "hook-retrieve", "--shim-id", "fimemory-v1", "--home", otherStore],
+                  },
+                ],
+              },
+            ],
+          },
+        }),
+      ),
+    );
+    // And the user is told, with the way to opt in.
+    const warned = r.warnings.join(" ");
+    expect(warned).toMatch(/did NOT repoint/i);
+    expect(warned).toMatch(/--force-rewire/);
+  });
+
+  it("--force-rewire switches the machine over deliberately", async () => {
+    const { remote } = fixtureRemoteStore();
+    const dest = freshHome("join-force-dest");
+    const rulesFile = scratchRulesFile("force");
+    const otherStore = freshHome("join-force-existing-store");
+    const settingsPath = path.join(freshHome("join-force-settings"), "settings.json");
+    mkdirSync(path.dirname(settingsPath), { recursive: true });
+    writeFileSync(
+      settingsPath,
+      JSON.stringify({
+        hooks: {
+          UserPromptSubmit: [
+            {
+              hooks: [
+                {
+                  type: "command",
+                  command: "node",
+                  args: ["/somewhere/cli.js", "hook-retrieve", "--home", otherStore],
+                },
+              ],
+            },
+          ],
+        },
+      }),
+      "utf8",
+    );
+
+    const r = await joinStore({
+      gitUrl: remote,
+      home: dest,
+      env: {} as NodeJS.ProcessEnv,
+      installHooks: false,
+      rulesFile,
+      settingsPath,
+      forceRewire: true,
+    });
+
+    expect(r.rulesPath).toBe(rulesFile);
+    expect(existsSync(rulesFile)).toBe(true);
+  });
+
   it("clones a fixture remote, verifies shape, guides passphrase, installs rules", async () => {
     const { remote } = fixtureRemoteStore();
     const dest = freshHome("join-dest");
@@ -64,6 +173,13 @@ describe("join <git-url> — team playbook join flow", () => {
       env: {} as NodeJS.ProcessEnv,
       installHooks: false, // avoid writing ~/.claude/settings.json in tests
       rulesFile, // ...and avoid writing ~/.claude/CLAUDE.md
+      // ...and pin the machine state the rewire guard reads. Without this the
+      // guard inherits the DEVELOPER'S live wiring, sees it pointing at their
+      // real store, correctly concludes "this box already belongs to another
+      // store", and skips the rules write — so this test would pass or fail
+      // depending on whose laptop ran it. An absent file means "no wiring yet",
+      // which is the fresh-machine case this test is actually about.
+      settingsPath: path.join(freshHome("join-settings-dest"), "settings.json"),
     });
     expect(r.rulesPath).toBe(rulesFile);
     expect(existsSync(rulesFile)).toBe(true);

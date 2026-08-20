@@ -502,19 +502,37 @@ export function assertAppendable(
     // descent, and every step costs a round trip.
     //
     // The overage is arithmetic we already have, so give it — plus a rough word
-    // count, because a caller edits words rather than tokens. 0.75 words/token
-    // is deliberately conservative for prose so that following the advice
-    // overshoots into success rather than landing one token short again.
+    // count, because a caller edits words rather than tokens.
+    //
+    // BUT A WORD FIGURE IS A GUESS, AND A GUESS CANNOT CONVERGE. Naming the
+    // overage helped and did not close it. One agent writing a single entry on
+    // 2026-08-18 descended 489, 450, 435, 423, 412, 399, 387, 375, 362, 353,
+    // 351, 350 against a cap of 350 — eleven round trips, the last four missing
+    // by single digits; another burned five on a different entry the same night.
+    // The estimate erred in the right direction and it did not help, because a
+    // caller asked to shorten prose REWRITES it, and a rewrite re-inflates: the
+    // words removed are not the words that come back.
+    //
+    // Characters are exact where words are not. countTokens is ceil(len / 4), so
+    // cutting (len - cap * 4) characters leaves exactly cap * 4 characters, and
+    // ceil(cap * 4 / 4) === cap, which is not over. That converges on the FIRST
+    // retry by arithmetic rather than by luck. The word figure stays as a
+    // secondary hint, because people do edit words — but the exact number leads.
     //
     // And name the cap as a SETTING. A caller who genuinely needs longer entries
     // should know it is theirs to raise, instead of grinding paragraphs down to
     // fit a number they cannot see.
     const over = tokens - entryTokenCap;
     const words = Math.max(1, Math.ceil(over * 0.75));
+    /** The smallest cut guaranteed to pass. */
+    const overChars = Math.max(1, block.length - entryTokenCap * 4);
     throw new GestaltError(
       "E_TOKEN_CAP",
-      `Entry is ${tokens} tokens; the cap is ${entryTokenCap}. Cut about ${over} tokens (roughly ${words} words).`,
-      `Shorten the summary or body by ~${words} words and retry, or raise \`entryTokenCap\` in the store's config.json if entries this size are normal for you.`,
+      `Entry is ${tokens} tokens / ${block.length} characters; the cap is ${entryTokenCap} tokens / ` +
+        `${entryTokenCap * 4} characters. Cut ${overChars} characters (about ${words} words).`,
+      `Remove at least ${overChars} characters from the summary or body and retry — that exact figure ` +
+        `will pass. Or raise \`entryTokenCap\` in the store's config.json if entries this size are ` +
+        `normal for you.`,
     );
   }
   const bodyLines = block.split("\n").slice(1);
