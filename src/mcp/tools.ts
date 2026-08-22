@@ -1,6 +1,7 @@
 import { GestaltError } from "../errors.js";
 import type { Warning } from "../errors.js";
-import { loadConfig } from "../config.js";
+import { DEFAULT_CONFIG, loadConfig } from "../config.js";
+import type { HomeSource } from "../paths.js";
 import { runStatus } from "../commands/status.js";
 import { createTopic } from "../ops/create.js";
 import { get } from "../ops/get.js";
@@ -121,18 +122,19 @@ export const TOOLS: ToolDef[] = [
     //
     // The neighbouring create tool has always documented its limits exactly
     // ("2–64 characters", "up to 120 characters"); this one simply did not.
-    // 350 tokens is the default entryTokenCap and is named as a default, since a
-    // store may raise it.
+    // The numbers interpolate from DEFAULT_CONFIG so they cannot drift again
+    // (the literal drifted once already, 200 → 350), and are named as a
+    // default, since a store's config.json may set a different cap.
     description:
-      "Append a typed changelog entry as you learn something — decision · pattern · gotcha · convention · supersede. Logging never changes the curated note, so log often — but keep each entry under ~1,400 characters (the store's entryTokenCap, 350 tokens by default); longer entries are REJECTED. Split a long finding into two entries rather than trimming it to fit.",
+      `Append a typed changelog entry as you learn something — decision · pattern · gotcha · convention · supersede. Logging never changes the curated note, so log often — but keep each entry (summary + body) under ~${DEFAULT_CONFIG.entryTokenCap * 4} characters (the store's entryTokenCap, ${DEFAULT_CONFIG.entryTokenCap} tokens by default; a store's config.json can set a different cap); longer entries are REJECTED with the exact character cut that will pass. Split a long finding into two entries rather than trimming it to fit.`,
     inputSchema: {
       type: "object",
       properties: {
         id: { type: "string" },
         type: { type: "string", enum: ["decision", "pattern", "gotcha", "convention", "supersede"] },
         project: { type: "string" },
-        summary: { type: "string", description: "One line (required). Counts toward the ~1,400 character entry limit." },
-        body: { type: "string", description: "Optional detail. Summary + body must total under ~1,400 characters." },
+        summary: { type: "string", description: `One line (required). Counts toward the entry cap (~${DEFAULT_CONFIG.entryTokenCap * 4} characters by default).` },
+        body: { type: "string", description: `Optional detail. Summary + body must fit the store's entryTokenCap (~${DEFAULT_CONFIG.entryTokenCap * 4} characters by default).` },
         supersedes: { type: "string", description: "Timestamp of an entry this supersedes." },
         refs: {
           type: "array",
@@ -207,6 +209,9 @@ export interface ToolStructured {
   topicCount?: number;
   pendingProposals?: number;
   budget?: { maxTokensPerGet: number; maxTopicsPerGet: number; noteTokenCap: number; noteTokenWarn: number };
+  /** R2: the store this response answered from, on EVERY response — home path
+   * always; `source` (which resolution rule picked it) when the caller knows. */
+  store?: { home: string; source?: HomeSource };
   [key: string]: unknown;
 }
 
@@ -237,14 +242,55 @@ function capText(text: string, capTokens: number): string {
   return slice + marker;
 }
 
+/** The R2 which-store line appended to every tool response's text. Terse on
+ * purpose: it rides every response, and two tests budget response tokens. */
+function storeLine(home: string): string {
+  return `[fimemory store: ${home}]`;
+}
+
+/** Tokens to reserve inside a hard-capped response so the appended store line
+ * never pushes the delivered text over the budget (invariant 3). Separate
+ * ceil-per-part can only overshoot the combined count, so reserving the
+ * line's own count keeps the total under the cap. */
+function storeLineReserve(home: string): number {
+  return countTokens(`\n${storeLine(home)}`);
+}
+
 /**
  * Execute one tool call. Inputs are validated at this boundary — before any
  * filesystem read — so an oversized request cannot become an oversized response
  * (Gate #2 #1/#3). Unknown/extra arguments (e.g. a smuggled `force` or
  * `allowOwnerNotes`) are never read. Returns human text plus a structured
  * sidecar (`warnings[]`, error `{code,message,hint}`, meters) per SPEC §5.8.
+ *
+ * EVERY response — success, E_SCHEMA, E_LOCKED, op error — names the store it
+ * answered from, in text and in `structured.store` (R2, ruled transparency UX
+ * 2026-08-19: the 8/15 near-miss class is an agent confidently answering from
+ * the wrong store, and the absence of this line is why nobody noticed).
+ * `source` says which resolution rule picked the home; the MCP server learns
+ * it once at startup from the CLI and it never changes for the process.
  */
 export async function callTool(
+  home: string,
+  name: string,
+  args: Record<string, unknown>,
+  source?: HomeSource,
+): Promise<ToolResult> {
+  const r = await callToolInner(home, name, args);
+  r.text = r.text ? `${r.text}\n${storeLine(home)}` : storeLine(home);
+  r.structured = {
+    ...r.structured,
+    store: { home, ...(source !== undefined ? { source } : {}) },
+  };
+  // deliveredTokens is a promise about the FINAL on-wire text; recompute it
+  // after decoration wherever a tool reported it (fimemory_get today).
+  if (r.structured.deliveredTokens !== undefined) {
+    r.structured.deliveredTokens = countTokens(r.text);
+  }
+  return r;
+}
+
+async function callToolInner(
   home: string,
   name: string,
   args: Record<string, unknown>,
@@ -399,7 +445,12 @@ export async function callTool(
         parts.push(`\n[served ${r.tokensUsed} of the read budget${r.clamped ? "; clamped" : ""}]`);
         // The DELIVERED text (wrappers + warnings included) is hard-capped at
         // the per-response budget (invariant 3; Gate #2 #1/#4).
-        const text = capText(parts.join("\n\n") + warningsText(r.warnings), config.maxTokensPerGet);
+        const text = capText(
+          parts.join("\n\n") + warningsText(r.warnings),
+          // Reserve room for the appended store line so the decorated response
+          // still fits the per-response budget (invariant 3; R2).
+          config.maxTokensPerGet - storeLineReserve(home),
+        );
         return {
           text,
           isError: false,

@@ -49,8 +49,9 @@ import { compact } from "./ops/compact.js";
 import { pack } from "./ops/pack.js";
 import { reindexStore } from "./ops/reindexOp.js";
 import { buildDemoStore } from "./ops/demoStore.js";
-import { loadConfig } from "./config.js";
-import { resolveHome, storePaths } from "./paths.js";
+import { DEFAULT_CONFIG, loadConfig } from "./config.js";
+import { resolveHomeWithSource, storePaths } from "./paths.js";
+import type { HomeSource } from "./paths.js";
 import {
   peekSessionCache,
   readSessionCache,
@@ -121,6 +122,11 @@ Everyday:
   get <id...> [--log-tail N]   Read topics within a budget
   create <id> --title "..."    Start a new topic
   log <id> --type T --project P -m "..."   Add a typed changelog entry
+    [--body "..."]             Optional detail. Summary + body count against the store's
+                               entryTokenCap — ${DEFAULT_CONFIG.entryTokenCap} tokens / ~${DEFAULT_CONFIG.entryTokenCap * 4} characters by default,
+                               a store's config.json can differ; over-cap entries are
+                               REJECTED naming the exact cut that passes, so split a
+                               long finding into two entries
     [--refs repo#path[@sha],...]  Comma-separated file refs this entry is grounded in
                                (portable repo#path[@sha], or an absolute path —
                                stored machine-scoped as ~machineId:/abs/path)
@@ -204,7 +210,7 @@ Maintenance:
 About:
   supporters                   Print the ${SUPPORTERS_FILE} that ships with this package (opt-in credit)
 
-Options: --home <path>  --json  --strict  --allow-owner-notes  -h/--help  --version
+Options: --home <path> (alias: --store; env FIMEMORY_STORE / FIMEMORY_HOME)  --json  --strict  --allow-owner-notes  -h/--help  --version
 Encrypted stores: --encrypted (setup, init) — always with --passphrase "..." or GESTALT_PASSPHRASE
   --passphrase "..." also unlocks an existing store (unlock, recover)
   One unlock keeps commands fast for ~8h (config sessionKeyCacheTtlHours; 0 disables; fimemory lock ends it)`;
@@ -242,7 +248,7 @@ function parseArgs(argv: string[]): Args {
     values: {},
   };
   const valueFlags = new Set([
-    "home", "title", "type", "project", "message", "m", "body",
+    "home", "store", "title", "type", "project", "message", "m", "body",
     "supersedes", "refs", "file", "proposer", "for", "log-tail", "since", "passphrase", "mnemonic",
     "mode", "session-id", "budget-ms", "shim-id", "keyring",
   ]);
@@ -276,7 +282,9 @@ function parseArgs(argv: string[]): Args {
     } else if (a.command === undefined) a.command = arg;
     else a.positionals.push(arg);
   }
-  a.home = a.values["home"];
+  // --store is the R2 alias of --home (one resolution slot). Both given with
+  // different values is refused loudly at dispatch, never silently resolved.
+  a.home = a.values["home"] ?? a.values["store"];
   return a;
 }
 
@@ -379,7 +387,20 @@ async function main(argv: string[]): Promise<number> {
     return args.command === undefined && !args.values["help"] ? 1 : 0;
   }
 
-  const homePath = resolveHome(args.home !== undefined ? { home: args.home } : {});
+  // R2: --home and --store are one slot; both set to DIFFERENT stores is a
+  // contradiction we refuse loudly (D0.4 spirit: never silently pick one).
+  if (
+    args.values["home"] !== undefined &&
+    args.values["store"] !== undefined &&
+    args.values["home"] !== args.values["store"]
+  ) {
+    return usageError(
+      `--home (${args.values["home"]}) and --store (${args.values["store"]}) disagree — they are aliases for the same store; pass one.`,
+    );
+  }
+  const resolvedHome = resolveHomeWithSource(args.home !== undefined ? { home: args.home } : {});
+  const homePath = resolvedHome.home;
+  const homeSource = resolvedHome.source;
   const opts = { home: homePath };
 
   try {
@@ -1052,9 +1073,9 @@ async function main(argv: string[]): Promise<number> {
       }
       case "status": {
         const r = runStatus(opts);
-        if (args.json) out(JSON.stringify(r, null, 2));
+        if (args.json) out(JSON.stringify({ ...r, homeSource }, null, 2));
         else {
-          out(`FIMemory store: ${r.home}`);
+          out(`FIMemory store: ${r.home} (picked by ${describeHomeSource(homeSource)})`);
           out();
           out(`  Topics:          ${fmt(r.topicCount)}`);
           out(`  Suggested edits: ${r.pendingProposals === 0 ? "none" : `${fmt(r.pendingProposals)} waiting for you`}`);
@@ -1382,7 +1403,7 @@ async function main(argv: string[]): Promise<number> {
       }
       case "mcp": {
         // Start the stdio MCP server and keep the process alive until stdin ends.
-        runStdioServer(homePath);
+        runStdioServer(homePath, homeSource);
         return new Promise<number>(() => {});
       }
       case "install-mcp": {
@@ -1513,10 +1534,10 @@ async function main(argv: string[]): Promise<number> {
       case "doctor": {
         const r = runDoctor({ home: homePath });
         if (args.json) {
-          out(JSON.stringify(r, null, 2));
+          out(JSON.stringify({ ...r, homeSource }, null, 2));
           return r.healthy ? 0 : 1;
         }
-        out(c.b(`FIMemory doctor — ${r.home}`));
+        out(c.b(`FIMemory doctor — ${r.home} (picked by ${describeHomeSource(homeSource)})`));
         out();
         // Store + keys
         const modeLine =
@@ -2252,6 +2273,21 @@ async function runHookRetrieve(home: string, args: Args): Promise<number> {
   }
   if (!prompt.trim()) return 0;
 
+  // DOUBLE-HOOK GUARD (plugin un-hold, 0.3.1): with both the settings.json
+  // handler and the plugin's hooks.json installed, the same prompt fires
+  // hook-retrieve twice and the second injection doubles the context cost.
+  // First invocation wins an exclusive tmp marker; the loser exits empty.
+  // Keyed on (session, prompt), so it needs a session id — and every failure
+  // inside the guard fails open (see hookDedupe.ts).
+  if (sessionId) {
+    try {
+      const { hookAlreadyServed } = await import("./ops/hookDedupe.js");
+      if (hookAlreadyServed(sessionId, prompt)) return 0;
+    } catch {
+      /* fail open */
+    }
+  }
+
   // Machine-generated prompts (task notifications, control tags) waste tokens
   // if we retrieve. Cheap skip — must stay fail-open and under the 300ms budget.
   if (isNonHumanPrompt(prompt, payload)) {
@@ -2421,6 +2457,17 @@ function strip(noteText: string): string {
 function logTail(args: Args): { logTail: number } {
   const n = args.values["log-tail"];
   return { logTail: n !== undefined ? Number(n) : DEFAULT_LOG_TAIL };
+}
+
+/** Human wording for the R2 which-store indicator. Reads as normal state,
+ * never as a misconfiguration — an existing legacy store is a supported home. */
+function describeHomeSource(source: HomeSource): string {
+  switch (source) {
+    case "flag": return "--home/--store";
+    case "default": return "default ~/.fimemory";
+    case "default-legacy": return "default, existing legacy ~/.gestalt";
+    default: return source;
+  }
 }
 
 function usageError(message: string): number {

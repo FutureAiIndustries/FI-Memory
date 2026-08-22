@@ -696,7 +696,7 @@ export function runDoctor(opts: DoctorOptions = {}): DoctorReport {
             level: "fail",
             code: "store_missing",
             message: `No FIMemory store at ${home}.`,
-            hint: "Run `fimemory init` (add --encrypted for at-rest encryption), or point --home / GESTALT_HOME at the real store.",
+            hint: "Run `fimemory init` (add --encrypted for at-rest encryption), or point --home/--store (or FIMEMORY_STORE / FIMEMORY_HOME; legacy GESTALT_HOME still works) at the real store.",
           },
     );
   } else if (!(keyringExists(home) || storeHasSealedContent(home))) {

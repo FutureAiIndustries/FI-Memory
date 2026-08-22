@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "fimemory": {
-      "command": "fimemory",
-      "args": ["mcp"]
-    }
-  }
-}

@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "fimemory",
   "displayName": "FIMemory",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Local-first shared memory for AI tools. Plain files are the source of truth; relevant context is injected before your prompt instead of burned on agentic search loops.",
   "author": {
     "name": "Future Industries",
@@ -19,6 +19,5 @@
     "retrieval",
     "knowledge-base"
   ],
-  "mcpServers": "./.mcp.json",
   "hooks": "./hooks/hooks.json"
 }

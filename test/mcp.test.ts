@@ -516,3 +516,54 @@ describe("install-mcp (SPEC §5.1, rev 6)", () => {
     expect(r.warnings.some((w) => w.code === "not_built")).toBe(true);
   });
 });
+
+describe("R2 — every MCP response names the store it answered from", () => {
+  // The 8/15 near-miss class is an agent confidently answering from the WRONG
+  // store, and nothing in any response said which store had answered. Ruled
+  // transparency UX 2026-08-19 (D8): a terse store line on every response's
+  // text, and structured.store on every sidecar so structuredContent-first
+  // clients (Claude Code) see it too.
+
+  it("all seven tools carry the store line in text AND structured.store.home", async () => {
+    const home = store();
+    await createTopic(home, "store-line-topic", "Store Line Topic", { now: clockAt(1e12) });
+    const calls: Array<[string, Record<string, unknown>]> = [
+      ["fimemory_status", {}],
+      ["fimemory_search", { query: "store line" }],
+      ["fimemory_get", { ids: ["store-line-topic"] }],
+      ["fimemory_create", { id: "store-line-b", title: "B" }],
+      ["fimemory_log", { id: "store-line-topic", type: "decision", project: "t", summary: "s" }],
+      ["fimemory_update", { id: "store-line-topic", note: "---\nid: store-line-topic\n---\n\nBody.\n\n## Owner notes\n" }],
+      ["fimemory_compact", { id: "store-line-topic" }],
+    ];
+    for (const [name, args] of calls) {
+      const r = await call(home, name, args);
+      expect(r.result, name).toBeDefined();
+      expect(r.result!.content[0]!.text, name).toContain(`[fimemory store: ${home}]`);
+      const st = r.result!.structuredContent!.store as { home: string } | undefined;
+      expect(st, name).toBeDefined();
+      expect(st!.home, name).toBe(home);
+    }
+  });
+
+  it("schema errors name the store too — the wrong-store class hits failures hardest", async () => {
+    const home = store();
+    const r = await call(home, "fimemory_search", {});
+    expect(r.result!.isError).toBe(true);
+    expect(r.result!.content[0]!.text).toContain(`[fimemory store: ${home}]`);
+    expect((r.result!.structuredContent!.store as { home: string }).home).toBe(home);
+  });
+
+  it("the get budget still holds with the store line inside it (invariant 3)", async () => {
+    const home = store();
+    writeNote(home, "budget-check", {
+      title: "Budget Check",
+      body: `\n${"albatross kingfisher osprey petrel cormorant ".repeat(900)}\n\n## Owner notes\n`,
+    });
+    const r = await call(home, "fimemory_get", { ids: ["budget-check"] });
+    const text = r.result!.content[0]!.text;
+    expect(text).toContain(`[fimemory store: ${home}]`);
+    expect(countTokens(text)).toBeLessThanOrEqual(2000);
+    expect(r.result!.structuredContent!.deliveredTokens).toBe(countTokens(text));
+  });
+});

@@ -1,6 +1,6 @@
 {
   "name": "fimemory",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "FIMemory, by Future Industries — a local store your AI tools can read, once connected and told to. Plain files on your own disk; optional encryption at rest.",
   "license": "SEE LICENSE IN LICENSE.md",
   "type": "module",

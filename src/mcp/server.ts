@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { MCP_SERVER_KEY } from "../brand.js";
 import { TOOL_NAMES, TOOLS, callTool } from "./tools.js";
+import type { HomeSource } from "../paths.js";
 
 const PROTOCOL_VERSION = "2025-06-18";
 
@@ -52,6 +53,7 @@ function rpcError(id: unknown, code: number, message: string): object {
 export async function handleRpc(
   home: string,
   msg: JsonRpcMessage,
+  homeSource?: HomeSource,
 ): Promise<object | null> {
   const { id, method, params } = msg;
   const isNotification = id === undefined || id === null;
@@ -86,7 +88,7 @@ export async function handleRpc(
       if (!p.name || !TOOL_NAMES.has(p.name)) {
         return rpcError(id, -32602, `Unknown tool: ${p.name ?? "(none)"}`);
       }
-      const r = await callTool(home, p.name, p.arguments ?? {});
+      const r = await callTool(home, p.name, p.arguments ?? {}, homeSource);
       const res: Record<string, unknown> = {
         content: [{ type: "text", text: r.text }],
         isError: r.isError,
@@ -106,7 +108,7 @@ export async function handleRpc(
  * JSON-RPC correlates by id, so ordering is a robustness guarantee, not a
  * correctness requirement).
  */
-export function runStdioServer(home: string): void {
+export function runStdioServer(home: string, homeSource?: HomeSource): void {
   let buffer = "";
   const pending = new Set<Promise<void>>();
   let writeChain: Promise<void> = Promise.resolve();
@@ -122,7 +124,7 @@ export function runStdioServer(home: string): void {
   };
 
   const track = (line: string): void => {
-    const p = processLine(home, line, writeLine).finally(() => pending.delete(p));
+    const p = processLine(home, line, writeLine, homeSource).finally(() => pending.delete(p));
     pending.add(p);
   };
 
@@ -153,6 +155,7 @@ async function processLine(
   home: string,
   line: string,
   writeLine: (line: string) => Promise<void>,
+  homeSource?: HomeSource,
 ): Promise<void> {
   let msg: JsonRpcMessage;
   try {
@@ -161,6 +164,6 @@ async function processLine(
     await writeLine(JSON.stringify(rpcError(null, -32700, "Parse error")));
     return;
   }
-  const response = await handleRpc(home, msg);
+  const response = await handleRpc(home, msg, homeSource);
   if (response) await writeLine(JSON.stringify(response));
 }

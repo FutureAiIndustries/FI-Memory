@@ -42,18 +42,60 @@ export function defaultHome(userHome: string = os.homedir()): string {
 }
 
 /**
+ * Which rule picked the home — the "which store am I in" provenance (R2,
+ * ruled transparency UX 2026-08-19). `flag` covers both `--home` and its
+ * `--store` alias; the env sources name the exact variable that won; the two
+ * default forms distinguish a fresh `~/.fimemory` from an existing legacy
+ * `~/.gestalt` opened in place.
+ */
+export type HomeSource =
+  | "flag"
+  | "FIMEMORY_STORE"
+  | "GESTALT_STORE"
+  | "FIMEMORY_HOME"
+  | "GESTALT_HOME"
+  | "default"
+  | "default-legacy";
+
+export interface ResolvedHome {
+  home: string;
+  source: HomeSource;
+}
+
+/**
  * Resolve the store home directory as an absolute, display-form path.
- * Precedence (SPEC §1): `--home` flag > `FIMEMORY_HOME` > `GESTALT_HOME` >
- * `~/.fimemory` (or an existing `~/.gestalt`, see `defaultHome`).
+ * Precedence (SPEC §1, extended by R2): `--home`/`--store` flag >
+ * `FIMEMORY_STORE` > `FIMEMORY_HOME` > (legacy `GESTALT_STORE` >
+ * `GESTALT_HOME`) > `~/.fimemory` (or an existing `~/.gestalt`, see
+ * `defaultHome`). `STORE` outranks `HOME` because it is the more specific
+ * spelling, matching readEnv's new-name-then-legacy rationale.
  * Empty/whitespace overrides are ignored so a stray `FIMEMORY_HOME=` cannot
  * silently point the store at the filesystem root.
  */
-export function resolveHome(opts: HomeOpts = {}): string {
+export function resolveHomeWithSource(opts: HomeOpts = {}): ResolvedHome {
   const env = opts.env ?? process.env;
   const fromFlag = opts.home?.trim();
-  const fromEnv = readEnv("HOME", env);
-  const chosen = fromFlag || fromEnv || defaultHome(opts.userHome);
-  return path.resolve(chosen);
+  if (fromFlag) return { home: path.resolve(fromFlag), source: "flag" };
+  // readEnv prefers the new prefix and falls back per-suffix; name the exact
+  // variable that won so the indicator never lies about provenance.
+  for (const suffix of ["STORE", "HOME"] as const) {
+    const value = readEnv(suffix, env);
+    if (value) {
+      const newName = `FIMEMORY_${suffix}` as HomeSource;
+      const legacyName = `GESTALT_${suffix}` as HomeSource;
+      const source = env[`FIMEMORY_${suffix}`]?.trim() ? newName : legacyName;
+      return { home: path.resolve(value), source };
+    }
+  }
+  const userHome = opts.userHome ?? os.homedir();
+  const chosen = defaultHome(userHome);
+  const source: HomeSource =
+    path.basename(chosen) === LEGACY_STORE_DIRNAME ? "default-legacy" : "default";
+  return { home: path.resolve(chosen), source };
+}
+
+export function resolveHome(opts: HomeOpts = {}): string {
+  return resolveHomeWithSource(opts).home;
 }
 
 /** All the on-disk paths for a store (SPEC §1 layout), in display form. */

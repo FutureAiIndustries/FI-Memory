@@ -360,6 +360,7 @@ describe("contention: git-synced team store", () => {
       agent: "a",
       supersedes: null,
       reported: null,
+      refs: [],
       summary: "older decision that landed later in the file",
       raw: "### 2026-07-28T10:00:00.000Z | decision | team | a\nolder decision that landed later in the file",
     };
@@ -370,6 +371,7 @@ describe("contention: git-synced team store", () => {
       agent: "c",
       supersedes: null,
       reported: null,
+      refs: [],
       summary: "middle entry",
       raw: "### 2026-07-28T11:00:00.000Z | pattern | team | c\nmiddle entry",
     };
@@ -380,6 +382,7 @@ describe("contention: git-synced team store", () => {
       agent: "b",
       supersedes: null,
       reported: null,
+      refs: [],
       summary: "newest fact the agent must see",
       raw: "### 2026-07-28T12:00:00.000Z | gotcha | team | b\nnewest fact the agent must see",
     };

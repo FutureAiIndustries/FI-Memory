@@ -39,7 +39,8 @@ function entry(
   summary: string,
 ): LogEntry {
   const raw = formatEntryBlock(ts, { type, project, agent, summary });
-  return { timestamp: ts, type, project, agent, supersedes: null, reported: null, summary, raw };
+  return { timestamp: ts, type, project, agent, supersedes: null, reported: null,
+      refs: [], summary, raw };
 }
 
 describe("encrypted log codec (E1)", () => {
