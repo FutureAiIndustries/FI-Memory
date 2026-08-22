@@ -88,7 +88,7 @@ describe("CLI spawn harness — isolation is enforced, not assumed", () => {
 describe("CLI dispatch — exit codes and streams the in-process suite cannot see", () => {
   it("a verb that succeeds exits 0, names what it did on stdout, and leaves the store on disk", () => {
     const home = freshHome("cli-init");
-    const r = runCli(["init", "--no-seed"], { home });
+    const r = runCli(["init", "--no-seed", "--plaintext"], { home });
 
     expect(r.code).toBe(0);
     expect(r.stderr).toBe("");
@@ -97,6 +97,74 @@ describe("CLI dispatch — exit codes and streams the in-process suite cannot se
     // "exit 0 while nothing happened" is precisely the defect class this file
     // exists for, and it is invisible to a test that only reads the op's return.
     expect(existsSync(path.join(home, "config.json"))).toBe(true);
+  });
+
+  it("0.5: bare `init` with no TTY and no passphrase fails CLOSED naming both remedies — never a silent plaintext store", () => {
+    const home = freshHome("cli-init-refuse");
+    const r = runCli(["init", "--no-seed"], { home });
+
+    expect(r.code).not.toBe(0);
+    expect(readsAsNodeCrash(r.stderr)).toBe(false);
+    expect(r.stderr).toContain("encrypted by default");
+    expect(r.stderr).toContain("--plaintext");
+    expect(r.stderr).toContain("GESTALT_PASSPHRASE");
+    // Fail closed means NOTHING on disk — a refusal that leaves a skeleton is
+    // the store_half_created defect all over again.
+    expect(existsSync(path.join(home, "config.json"))).toBe(false);
+  });
+
+  it("0.5: bare `init` with FIMEMORY_PASSPHRASE in the env creates an ENCRYPTED store and prints the phrase once", { timeout: 30_000 }, () => {
+    // The new name, end to end: before 0.5 the one verb that CREATES a store
+    // honoured only the legacy GESTALT_PASSPHRASE. Full Argon2id here (~1.5 s)
+    // — the CLI exposes no tiny-params override, by design.
+    const home = freshHome("cli-init-envpass");
+    const r = runCli(["init", "--no-seed"], {
+      home,
+      env: { FIMEMORY_PASSPHRASE: "a perfectly sturdy spawn passphrase" },
+    });
+
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("Created your ENCRYPTED store");
+    expect(r.stdout).toContain("WRITE THIS DOWN");
+    expect(existsSync(path.join(home, "keyring.json"))).toBe(true);
+    expect(existsSync(path.join(home, "store.enc"))).toBe(true);
+  });
+
+  it("0.5: --encrypted --plaintext is refused as the contradiction it is", () => {
+    const home = freshHome("cli-init-contradict");
+    const r = runCli(["init", "--encrypted", "--plaintext", "--no-seed"], { home });
+
+    expect(r.code).not.toBe(0);
+    expect(r.stderr).toContain("contradict");
+    expect(existsSync(path.join(home, "config.json"))).toBe(false);
+  });
+
+  it("0.5: `setup --plaintext` still says the plaintext cost out loud in next steps", { timeout: 60_000 }, () => {
+    // setup's fork surface, spawned: the opt-out works AND the standing cost
+    // is stated (the old world nudged plaintext users toward encrypt as an
+    // upsell; the new world names what they chose). Every host-config path a
+    // spawned setup could write goes through the redirected user home — a
+    // bare spawn would edit the DEVELOPER'S real host configs.
+    const home = freshHome("cli-setup-plain");
+    const userHome = freshHome("cli-setup-plain-user");
+    mkdirSync(userHome, { recursive: true });
+    const r = runCli(["setup", "--plaintext", "--no-seed"], {
+      home,
+      timeoutMs: 55_000,
+      env: {
+        HOME: userHome,
+        USERPROFILE: userHome,
+        APPDATA: path.join(userHome, "AppData"),
+        LOCALAPPDATA: path.join(userHome, "AppData", "Local"),
+        CODEX_HOME: path.join(userHome, ".codex"),
+        GEMINI_CLI_HOME: path.join(userHome, ".gemini"),
+        GROK_HOME: path.join(userHome, ".grok"),
+      },
+    });
+
+    expect(existsSync(path.join(home, "config.json"))).toBe(true);
+    expect(existsSync(path.join(home, "keyring.json"))).toBe(false);
+    expect(r.stdout).toContain("PLAINTEXT");
   });
 
   it("resolves a relative --plaintext destination against the CHILD's cwd, not the test runner's", () => {

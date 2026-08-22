@@ -127,7 +127,7 @@ function unwrap(kek: Uint8Array, w: WrappedKey): Uint8Array {
   return xchacha20poly1305(kek, unb64(w.n), WRAP_AAD).decrypt(unb64(w.ct));
 }
 
-function validatePassphrase(passphrase: string): void {
+export function validatePassphrase(passphrase: string): void {
   const p = passphrase.normalize("NFKC").trim();
   // The passphrase-wrapped KEK is a PARALLEL door to the same DEK the 24-word
   // phrase protects, so this gate must not be the weak link (R3 M). Two ways to

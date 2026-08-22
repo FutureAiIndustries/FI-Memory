@@ -29,7 +29,7 @@ import { checkIndexIntegrity } from "../store/index.js";
 import type { IndexIntegrity } from "../store/index.js";
 import { readTelemetry } from "../telemetry.js";
 import type { IndexRepairRecord, ReadHeartbeat } from "../telemetry.js";
-import { PROPOSAL_CAP_WARN_RATIO, assessContent, notAssessed } from "./contentReadiness.js";
+import { PROPOSAL_CAP_WARN_RATIO, assessContent, assessContentSealed, notAssessed } from "./contentReadiness.js";
 import type { ContentReadiness } from "./contentReadiness.js";
 import {
   STALE_AFTER_MS,
@@ -686,19 +686,19 @@ export function runDoctor(opts: DoctorOptions = {}): DoctorReport {
             code: "store_half_created",
             // Named separately from `store_missing` because the remedy is
             // different: `init` REFUSES over this folder on some paths and the
-            // reader is left re-running a command that cannot succeed, and a
-            // plain `setup` here would silently create a PLAINTEXT store where
-            // an encrypted one was asked for.
+            // reader is left re-running a command that cannot succeed. (Before
+            // 0.5's encrypted default, a plain `setup` here would also silently
+            // create a PLAINTEXT store where an encrypted one was asked for.)
             message:
               `A half-created store is at ${home}: topics/ exists but config.json does not, so this is not a usable store ` +
               "(an init that failed part-way leaves exactly this).",
-            hint: `Delete ${home} and run \`fimemory setup\` again (add --encrypted --passphrase "..." if you want it encrypted).`,
+            hint: `Delete ${home} and run \`fimemory setup\` again (encrypted by default — it needs a passphrase; --plaintext opts out).`,
           }
         : {
             level: "fail",
             code: "store_missing",
             message: `No FIMemory store at ${home}.`,
-            hint: "Run `fimemory init` (add --encrypted for at-rest encryption), or point --home/--store (or FIMEMORY_STORE / FIMEMORY_HOME; legacy GESTALT_HOME still works) at the real store.",
+            hint: "Run `fimemory init` (encrypted by default; --plaintext opts out), or point --home/--store (or FIMEMORY_STORE / FIMEMORY_HOME; legacy GESTALT_HOME still works) at the real store.",
           },
     );
   } else if (!(keyringExists(home) || storeHasSealedContent(home))) {
@@ -1385,9 +1385,16 @@ export function runDoctor(opts: DoctorOptions = {}): DoctorReport {
   // ── Content readiness — the second score (see DoctorReport.content) ───────
   const content = !storePresent
     ? notAssessed("no store")
-    : mode !== "plaintext"
-      ? notAssessed("encrypted store — doctor never derives keys, so content was not inspected")
-      : assessContent(home);
+    : mode === "plaintext"
+      ? assessContent(home)
+      : mode === "encrypted-unlocked"
+        ? // 0.5: an UNLOCKED encrypted store is assessed through the codec with
+          // the non-deriving key doctor already trusts (in-process key or warm
+          // cache) — with encryption the default, "not assessed forever" would
+          // blind the Content score for every new user. Locked stays honest:
+          // doctor never derives keys.
+          assessContentSealed(home, (ttlHours ?? 0) * 3_600_000)
+        : notAssessed("encrypted store is LOCKED — doctor never derives keys, so content was not inspected (unlock first)");
   if (content.assessed) {
     if (!content.hasUserContent) {
       // The LEVEL turns on whether anything has read the store yet, the same

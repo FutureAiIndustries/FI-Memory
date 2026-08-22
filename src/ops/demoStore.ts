@@ -85,7 +85,10 @@ function proposedNote(spec: DemoTopicData, body: string): string {
  * showing, and the plaintext path is the deterministic one.
  */
 export async function buildDemoStore(home: string): Promise<DemoStoreResult> {
-  runInit({ home });
+  // `encrypted: false` is explicit, not redundant: since 0.5 the CLI defaults
+  // NEW stores to encrypted, and if the library default ever follows, this
+  // call must keep meaning "plaintext, deterministically" without re-litigation.
+  runInit({ home, encrypted: false });
 
   // Structural reset (see module docs): drop the worked example (note, log,
   // and its sample proposal), rebuild the catalog so the monotonic floor and

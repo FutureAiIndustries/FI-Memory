@@ -38,7 +38,8 @@ plugin manager. Either alone works; both together is fine.
 
 ## Encrypted stores
 
-The store passphrase is **machine-local only**. Set `GESTALT_PASSPHRASE` in
+New stores are **encrypted by default** since 0.5 (`fimemory setup --plaintext`
+opts out). The store passphrase is **machine-local only**. Set `GESTALT_PASSPHRASE` in
 your OS user environment (never in chat, never in synced dotfiles, never in
 plugin config), or run `fimemory unlock` per TTL window. When the store is
 locked the hook **fails open**: empty inject, exit 0, your prompt is never

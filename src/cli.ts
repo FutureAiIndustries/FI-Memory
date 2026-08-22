@@ -71,8 +71,10 @@ import {
   reviewShow,
 } from "./ops/review.js";
 import { search } from "./ops/search.js";
-import { runSetup } from "./ops/setup.js";
+import { runSetup, storeExistsAt } from "./ops/setup.js";
 import type { SetupDetail, SetupStep } from "./ops/setup.js";
+import { confirmMnemonic, planFirstRun, ttyFirstRunIO } from "./ops/firstRun.js";
+import type { FirstRunIO, FirstRunPlan } from "./ops/firstRun.js";
 import { seedAfterInit } from "./ops/seed.js";
 import type { SeedResult } from "./ops/seed.js";
 import { SUPPORTERS_FILE, readSupporters } from "./ops/supporters.js";
@@ -105,11 +107,14 @@ const fmt = (n: number): string => n.toLocaleString("en-US");
 const USAGE = `${PRODUCT} — your shared memory for AI tools
 
 Start here:
-  setup [--encrypted [--passphrase "..."]]
+  setup [--plaintext] [--passphrase "..."]
                                Create the store IF NEEDED, then connect it to every AI
                                tool on this machine (MCP + rules + hook) and check it.
                                Safe to re-run. This is the one command most people want.
-                               --encrypted NEEDS a passphrase: this flag, or GESTALT_PASSPHRASE.
+                               New stores are ENCRYPTED by default — the passphrase comes
+                               from this flag, GESTALT_PASSPHRASE, or a guided prompt on a
+                               terminal (no terminal + no passphrase = a clean refusal).
+                               --plaintext opts out; --encrypted is accepted (the default).
   onboard [--status]           The guided first-win path, AFTER setup: run the review
                                loop once, put your first real facts in, see a search
                                answer with them, and learn what each tool still needs.
@@ -117,8 +122,9 @@ Start here:
                                scores (Connect / Content) and the remaining steps, ask nothing.
 
 Everyday:
-  init [--encrypted] [--no-seed]   Create your store ONLY — nothing reads it until you
-                               run \`setup\` (starter topics included; --no-seed skips them)
+  init [--plaintext] [--no-seed]   Create your store ONLY — nothing reads it until you
+                               run \`setup\` (starter topics included; --no-seed skips them).
+                               Encrypted by default, same passphrase sources as setup.
   status                       Store path, topics, suggested edits, read budget
   list                         Your topics, newest first
   search <words...>            Find topics (search first, then read a few)
@@ -218,7 +224,8 @@ About:
   supporters                   Print the ${SUPPORTERS_FILE} that ships with this package (opt-in credit)
 
 Options: --home <path> (alias: --store; env FIMEMORY_STORE / FIMEMORY_HOME)  --json  --strict  --allow-owner-notes  -h/--help  --version
-Encrypted stores: --encrypted (setup, init) — always with --passphrase "..." or GESTALT_PASSPHRASE
+Encrypted stores: NEW stores are encrypted by default (setup, init) — passphrase via --passphrase "...",
+  GESTALT_PASSPHRASE, or the guided prompt; --plaintext creates an unencrypted store instead
   --passphrase "..." also unlocks an existing store (unlock, recover)
   One unlock keeps commands fast for ~8h (config sessionKeyCacheTtlHours; 0 disables; fimemory lock ends it)`;
 
@@ -581,11 +588,17 @@ async function main(argv: string[]): Promise<number> {
 
     switch (args.command) {
       case "init": {
-        const encrypted = args.values["encrypted"] === "1";
+        // 0.5 (the trust lane): a NEW store made through the CLI is ENCRYPTED
+        // by default — `--plaintext` is the one-keystroke opt-out, `--encrypted`
+        // stays accepted for scripts that already say it. The library default
+        // in runInit stays plaintext on purpose; ops/firstRun.ts owns the
+        // argument for why the flip lives only at this boundary.
+        const firstRun = await planCliFirstRun(homePath, args.values, "init", args.json);
+        const plan: FirstRunPlan = firstRun?.plan ?? { encrypted: false, source: "plaintext" };
         const r = runInit({
           ...opts,
-          encrypted,
-          ...(args.values["passphrase"] ? { passphrase: args.values["passphrase"] } : {}),
+          encrypted: plan.encrypted,
+          ...(plan.passphrase !== undefined ? { passphrase: plan.passphrase } : {}),
         });
         // Seed-on-install (Lane F, F-A): three starter topics through the real
         // write path, on by default, `--no-seed` opts out. Runs after runInit so
@@ -599,8 +612,10 @@ async function main(argv: string[]): Promise<number> {
         if (args.values["no-seed"] !== "1") {
           const s = await seedAfterInit(homePath, {
             encrypted: r.encrypted,
-            ...(args.values["passphrase"] !== undefined
-              ? { passphraseFlag: args.values["passphrase"] }
+            // Whatever source supplied the passphrase — flag, env, or the
+            // guided prompt — the seed unlocks with the SAME one.
+            ...(plan.passphrase !== undefined
+              ? { passphraseFlag: plan.passphrase }
               : {}),
           });
           seeded = s.seeded;
@@ -661,19 +676,34 @@ async function main(argv: string[]): Promise<number> {
           out(`  ${c.b(`${BIN} setup`)}   Connect your AI tools (MCP + rules + hook), then check it. Safe to re-run.`);
           out();
           out(c.dim("Or look around first:"));
-          if (r.encrypted) {
-            // The old line here was `GESTALT_PASSPHRASE=... fimemory get …`,
-            // which is a parser error in BOTH shells a Windows user has — on
-            // the only platform this build is verified on. See brand.ts.
+          if (r.encrypted && !(firstRun?.interactive ?? false)) {
+            // Non-interactive encrypted create: the session cache is NOT
+            // warmed (finishEncryptedFirstRun is interactive-only), so the
+            // runnable example must carry the env var — platform-branched per
+            // brand.ts, never the POSIX env-prefix form that is a parser
+            // error in both Windows shells.
             for (const line of passphraseExample("get gestalt-example")) {
               out(c.dim(`  ${line}`));
             }
           } else {
+            // Plaintext, or the guided path — where the finish step below
+            // warms the session cache, so these run as-is.
             out(c.dim(`  ${BIN} list`));
             out(c.dim(`  ${BIN} get gestalt-example`));
             out(c.dim(`  ${BIN} review`));
           }
         }
+        if (r.encrypted && plan.passphrase !== undefined) {
+          await finishEncryptedFirstRun({
+            homePath,
+            passphrase: plan.passphrase,
+            mnemonic: r.mnemonic,
+            io: firstRun?.io,
+            interactive: firstRun?.interactive ?? false,
+            json: args.json,
+          });
+        }
+        firstRun?.io.close?.();
         return 0;
       }
       case "setup": {
@@ -691,16 +721,39 @@ async function main(argv: string[]): Promise<number> {
               `and \`${BIN} install-rules ${args.positionals[0]}\`.`,
           );
         }
+        // 0.5: same encrypted-by-default boundary as `init` — the plan is
+        // resolved BEFORE runSetup so a missing passphrase fails closed here,
+        // instead of the init step failing while install-mcp wires host
+        // configs to a store that never materialized. Null plan = a store is
+        // already here; setup skips init and no mode question exists.
+        const firstRun = await planCliFirstRun(homePath, args.values, "setup", args.json);
+        const plan = firstRun?.plan;
         // The whole install sequence, one verb, fault-isolated per step. See
         // ops/setup.ts for the contract (re-runnable, nothing aborts the rest).
         const r = await runSetup({
           home: homePath,
-          ...(args.values["encrypted"] === "1" ? { encrypted: true } : {}),
-          ...(args.values["passphrase"] !== undefined ? { passphrase: args.values["passphrase"] } : {}),
+          ...(plan?.encrypted ? { encrypted: true } : {}),
+          ...(plan?.passphrase !== undefined ? { passphrase: plan.passphrase } : {}),
           ...(args.values["no-seed"] === "1" ? { noSeed: true } : {}),
           ...(args.values["capture"] === "1" ? { capture: true } : {}),
         });
+        // Present in BOTH output shapes: the drill/warm belongs to creation,
+        // not to rendering (JSON skips the prompts and prints, keeps the warm).
+        const finishFirstRun = async (): Promise<void> => {
+          if (r.created && r.mnemonic && plan?.passphrase !== undefined) {
+            await finishEncryptedFirstRun({
+              homePath,
+              passphrase: plan.passphrase,
+              mnemonic: r.mnemonic,
+              io: firstRun?.io,
+              interactive: firstRun?.interactive ?? false,
+              json: args.json,
+            });
+          }
+        };
         if (args.json) {
+          await finishFirstRun();
+          firstRun?.io.close?.();
           out(JSON.stringify(r, null, 2));
           return r.ok ? 0 : 1;
         }
@@ -718,6 +771,8 @@ async function main(argv: string[]): Promise<number> {
           out();
           out(c.dim(`  Key id ${r.kid}. Lose BOTH your passphrase and this phrase and the data is gone, by design.`));
         }
+        await finishFirstRun();
+        firstRun?.io.close?.();
         renderWarnings(r.warnings);
         if (r.nextSteps.length > 0) {
           out();
@@ -2554,6 +2609,105 @@ function describeHomeSource(source: HomeSource): string {
 function usageError(message: string): number {
   process.stderr.write(`${message}\n\n${USAGE}\n`);
   return 1;
+}
+
+/* ── 0.5: the encrypted-by-default first run (CLI boundary only) ─────────── */
+
+/** IO for the non-interactive path: prints work, questions are a bug — by the
+ * time either ask runs, planFirstRun has already failed closed. */
+function nonInteractiveIO(): FirstRunIO {
+  const refuse = (): Promise<string> =>
+    Promise.reject(new Error("no TTY to ask on — planFirstRun should have failed closed"));
+  return { out, ask: refuse, askHidden: refuse };
+}
+
+/**
+ * Decide mode + passphrase for a CLI store creation (init/setup). Returns
+ * null when a store already exists at `homePath`: init will refuse and setup
+ * will skip, and prompting a human for a passphrase right before a refusal
+ * would be noise. Throws (fail closed) when encrypted is wanted, nothing
+ * supplies a passphrase, and there is no TTY to ask on.
+ */
+async function planCliFirstRun(
+  homePath: string,
+  values: Record<string, string | undefined>,
+  command: "init" | "setup",
+  jsonMode: boolean,
+): Promise<{ plan: FirstRunPlan; io: FirstRunIO; interactive: boolean } | null> {
+  if (values["encrypted"] === "1" && values["plaintext"] === "1") {
+    throw new GestaltError(
+      "E_SCHEMA",
+      "--encrypted and --plaintext contradict each other.",
+      "Pick one (encrypted is the default since 0.5).",
+    );
+  }
+  if (storeExistsAt(homePath)) return null;
+  // --json implies the non-interactive rule even on a real TTY — a JSON
+  // caller wants machine output, never a conversation (onboard's contract).
+  const interactive =
+    !jsonMode && process.stdin.isTTY === true && process.stdout.isTTY === true;
+  const io = interactive ? await ttyFirstRunIO() : nonInteractiveIO();
+  const plan = await planFirstRun({
+    explicitEncrypted: values["encrypted"] === "1",
+    explicitPlaintext: values["plaintext"] === "1",
+    ...(values["passphrase"] ? { passphraseFlag: values["passphrase"] } : {}),
+    env: process.env,
+    interactive,
+    io,
+    command,
+  });
+  return { plan, io, interactive };
+}
+
+/**
+ * After a CLI run CREATED an encrypted store: drill the shown-once phrase
+ * (interactive, non-JSON only — it references "the phrase above"), then warm
+ * the session cache so the very next command — the product's own
+ * recommendation is `onboard` — does not immediately demand the passphrase
+ * again. One deliberate Argon2 derivation; failure to warm costs convenience,
+ * never the store.
+ */
+async function finishEncryptedFirstRun(opts: {
+  homePath: string;
+  passphrase: string;
+  mnemonic?: string | undefined;
+  io?: FirstRunIO | undefined;
+  interactive: boolean;
+  json: boolean;
+}): Promise<void> {
+  // INTERACTIVE ONLY, deliberately. A script or CI run that supplied the
+  // passphrase by flag/env keeps 0.4 behavior to the byte: no prompts, no
+  // extra Argon2 derivation, and no session-cache entry written outside the
+  // store by a process nobody is sitting at — the env var that got it this
+  // far keeps working. The day-1 stutter this fixes only exists for a human.
+  if (!opts.interactive || opts.json) return;
+  if (opts.io && opts.mnemonic) {
+    out();
+    await confirmMnemonic(opts.io, opts.mnemonic);
+  }
+  let warmedHours: number | null = null;
+  try {
+    const ttlHours = loadConfig(storePaths(opts.homePath).config).config.sessionKeyCacheTtlHours;
+    const ttlMs = ttlHours * 3_600_000;
+    if (ttlMs > 0) {
+      const dek = unlockWithPassphrase(opts.homePath, opts.passphrase);
+      writeSessionCache(opts.homePath, dek, ttlMs);
+      warmedHours = ttlHours;
+    }
+  } catch {
+    /* cache warming is a convenience; the store is fine without it */
+  }
+  out();
+  if (warmedHours !== null) {
+    out(`Unlocked — commands on this machine stay fast for ~${String(warmedHours)}h (\`${BIN} lock\` ends that sooner).`);
+  }
+  out("To keep your AI tools reading this store across sessions, set GESTALT_PASSPHRASE for your user account:");
+  for (const line of passphraseExample("doctor")) out(`  ${line}`);
+  if (process.platform === "win32") {
+    out(c.dim(`  Persist it for GUI apps too (they read the OS user environment, not your shell): \`setx GESTALT_PASSPHRASE "..."\` — takes effect in NEW windows.`));
+  } else {
+    out(c.dim("  GUI apps read the OS user environment, not your shell — export it where your desktop session sees it."));
+  }
 }
 
 process.exit(await main(process.argv.slice(2)));

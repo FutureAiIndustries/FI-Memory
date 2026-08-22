@@ -411,7 +411,7 @@ describe("session key cache — the TTL has teeth: EVERY invocation sweeps (root
   it("an EXPIRED entry is deleted by ANY invocation — a plaintext store's status, no key, no warm read in sight", () => {
     withPrivateSessionDir("sweep-any", () => {
       const plain = freshHome("sweep-bystander");
-      expect(spawnCli(["init", "--home", plain]).status).toBe(0);
+      expect(spawnCli(["init", "--plaintext", "--home", plain]).status).toBe(0);
       // A leftover entry for some OTHER store, past its own expiry — the
       // pre-fix world deleted this only when a warm READ of that store ran.
       const x = freshHome("sweep-x");
@@ -859,7 +859,7 @@ describe("session key cache — round-3 audit: only ENOENT means nothing; foreig
       doctorCache(x, { expires: Date.now() - 1000 });
 
       const plain = freshHome("sweep-foreign-store");
-      expect(spawnCli(["init", "--home", plain]).status).toBe(0);
+      expect(spawnCli(["init", "--plaintext", "--home", plain]).status).toBe(0);
       expect(spawnCli(["status", "--home", plain]).status).toBe(0);
 
       expect(existsSync(sessionCachePath(x))).toBe(false); // ours by shape: swept
@@ -952,7 +952,7 @@ describe("session key cache — re-init invalidates the entry whatever the NEW s
       // `--encrypted` — so this path left the old store's DEK warm-usable for
       // its TTL, and the loud re-init warning could never fire here.
       rmSync(fsPath(home), { recursive: true, force: true });
-      const clean = spawnCli(["init", "--home", home]);
+      const clean = spawnCli(["init", "--plaintext", "--home", home]);
       expect(clean.status).toBe(0);
       expect(clean.stdout).toContain("Created");
       expect(clean.stderr).not.toMatch(/could not remove the cached session key/i);
@@ -986,7 +986,7 @@ describe("session key cache — re-init invalidates the entry whatever the NEW s
           chmodSync(path.dirname(file), 0o500);
         }
 
-        const r = spawnCli(["init", "--home", home]); // PLAINTEXT — no keyring on this path
+        const r = spawnCli(["init", "--plaintext", "--home", home]); // PLAINTEXT — no keyring on this path
         expect(r.status).toBe(0); // the init succeeded and may proceed…
         expect(r.stdout).toContain("Created");
         expect(r.stderr).toMatch(/could not remove the cached session key/i); // …but LOUDLY
@@ -996,7 +996,7 @@ describe("session key cache — re-init invalidates the entry whatever the NEW s
 
         // --json carries the same fact for scripts — on the plaintext path too.
         rmSync(fsPath(home), { recursive: true, force: true });
-        const rj = spawnCli(["init", "--home", home, "--json"]);
+        const rj = spawnCli(["init", "--plaintext", "--home", home, "--json"]);
         expect(rj.status).toBe(0);
         const parsed = JSON.parse(rj.stdout) as { encrypted: boolean; sessionKeyWipeFailed?: { path: string } };
         expect(parsed.encrypted).toBe(false);

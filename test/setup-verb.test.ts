@@ -298,7 +298,11 @@ describe("a refused encrypted install leaves nothing that looks like a store", (
     const f = r.findings.find((x) => x.code === "store_half_created");
     expect(f, "a skeleton must raise its own distinct finding").toBeTruthy();
     expect(f!.level).toBe("fail");
-    expect(f!.hint).toMatch(/--passphrase/); // the encrypted case is the one that produces it
+    // 0.5: the hint names the encrypted default and the way out — a passphrase
+    // is needed, --plaintext opts out (the encrypted case produced this
+    // finding in the first place).
+    expect(f!.hint).toMatch(/passphrase/);
+    expect(f!.hint).toMatch(/--plaintext/);
   });
 });
 
@@ -506,6 +510,13 @@ describe("init hands the reader off to the wiring", () => {
           GEMINI_CLI_HOME: path.join(userHome, ".gemini"),
           GROK_HOME: path.join(userHome, ".grok"),
           GESTALT_HOME: store,
+          // Scrubbed (empty = unset at the readEnv boundary): an ambient
+          // passphrase on the developer's box would let a spawned bare
+          // `setup` quietly create an ENCRYPTED store here and pass — while
+          // the same test fails closed on any machine without the export.
+          // Found live 2026-08-21, first run after the encrypted default.
+          GESTALT_PASSPHRASE: "",
+          FIMEMORY_PASSPHRASE: "",
           NO_COLOR: "1",
         },
       },
@@ -519,7 +530,9 @@ describe("init hands the reader off to the wiring", () => {
     // it: fimemory list", and left the reader believing they were done while
     // the store was connected to nothing.
     const userHome = fakeHome("init-handoff");
-    const r = cli(userHome, freshHome("setup-init-handoff-store"), ["init", "--no-seed"]);
+    // --plaintext: the handoff copy is what is under test, not the mode (a
+    // bare spawned init with no passphrase fails closed since 0.5).
+    const r = cli(userHome, freshHome("setup-init-handoff-store"), ["init", "--no-seed", "--plaintext"]);
     expect(r.status).toBe(0);
 
     // It says, in plain words, that nothing reads the store yet…
@@ -576,7 +589,9 @@ describe("init hands the reader off to the wiring", () => {
   it("is reachable as a real verb and re-runnable from the CLI", { timeout: 120_000 }, () => {
     const userHome = fakeHome("cli-setup", [".codex"]);
     const store = freshHome("setup-cli-store");
-    const first = cli(userHome, store, ["setup", "--json"]);
+    // --plaintext: this test is about idempotence, not mode — and a bare
+    // spawned `setup` with no passphrase now fails closed by design (0.5).
+    const first = cli(userHome, store, ["setup", "--json", "--plaintext"]);
     expect(first.status).toBe(0);
     const parsed = JSON.parse(first.stdout) as SetupResult;
     expect(parsed.created).toBe(true);

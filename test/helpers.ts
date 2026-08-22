@@ -220,12 +220,18 @@ export function runCli(args: string[], opts: CliRunOptions = {}): CliRun {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     GESTALT_HOME: opts.home ?? freshHome("cli-spawn"),
-    // Cleared, not sandboxed: a developer (or a CI box) with either of these
-    // exported would silently unlock stores a test believes are locked, and the
-    // test would pass here and fail for everyone else. Tests that WANT a key
-    // pass it through `env` explicitly.
+    // Cleared, not sandboxed: a developer (or a CI box) with any of these
+    // exported would silently unlock stores a test believes are locked — or,
+    // for the HOME/STORE spellings, redirect the spawned CLI at a real store
+    // the sandbox guard below never inspects (it checks GESTALT_HOME, and the
+    // FIMEMORY_ names OUTRANK it by readEnv's new-then-legacy precedence).
+    // Tests that WANT a key pass it through `env` explicitly.
     GESTALT_KEY: "",
     GESTALT_PASSPHRASE: "",
+    FIMEMORY_PASSPHRASE: "",
+    FIMEMORY_HOME: "",
+    FIMEMORY_STORE: "",
+    GESTALT_STORE: "",
     // The child's stdout is a pipe, so `useColor` is already false — but be
     // explicit, because an assertion that fails only under FORCE_COLOR is the
     // kind of flake nobody reproduces.

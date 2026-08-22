@@ -2,11 +2,16 @@
 
 **A local store your AI tools can read, once connected and told to.**
 
-FIMemory (FI Memory, by Future Industries) keeps your notes as plain Markdown
-files on your own computer, and connects your AI tools to them so you stop
-re-explaining the same project every session. The store is an ordinary folder.
-You can open it, read it, edit it, copy it to a USB stick and delete it.
-Nothing is uploaded anywhere.
+FIMemory (FI Memory, by Future Industries) keeps your notes on your own
+computer, and connects your AI tools to them so you stop re-explaining the
+same project every session. The store is an ordinary folder of your own files:
+no proprietary format, no server, no account, nothing uploaded anywhere.
+New stores are **encrypted at rest by default**. You choose a passphrase, a
+24-word recovery phrase prints once, and the files stay private wherever they
+travel: a git host, a cloud backup, a USB stick. Prefer files you can open in
+a text editor directly? Plaintext is one explicit choice away at setup, and an
+encrypted store exports back to readable Markdown any time, gated by nothing
+but your key.
 
 ## Start here
 
@@ -36,6 +41,16 @@ prints what landed and what did not. Running it again is safe and boring:
 everything already in place reports `unchanged` and nothing is rewritten. When
 you are not sure whether it worked, run it again.
 
+Creating a store on a terminal, `setup` walks you through encryption: you
+choose a passphrase (or press one key to opt out with `--plaintext`), it
+prints your 24-word recovery phrase once and asks you to prove you wrote it
+down, then leaves the store unlocked on this machine for about 8 hours. In a
+script or CI there is no prompt: pass `--passphrase "..."`, set
+`GESTALT_PASSPHRASE`, or say `--plaintext`. With none of those it refuses
+cleanly rather than guessing. Lose both the passphrase and the 24-word phrase
+and the data is gone, by design; that is what "your key, not our servers"
+costs, and the guided run will not let it happen silently.
+
 One step `setup` cannot finish for you is Claude Code, which manages its own
 config file. `setup` checks whether the `claude` command exists on this
 machine: if it does, it prints a single `claude mcp add` line for you to
@@ -56,11 +71,11 @@ Three commands you will want later:
 - `fimemory doctor` reads the whole setup back and tells you in plain words
   what is missing and what to do about it. A half-finished install is the most
   common way this goes wrong.
-- `fimemory setup --encrypted --passphrase "<a memorable sentence>"` does the
-  same install, with the store encrypted at rest. The passphrase is required:
-  either that flag or `GESTALT_PASSPHRASE` in your environment, and without one
-  the store is not created. It prints a 24-word recovery phrase once. Write it
-  down on paper.
+- `fimemory setup --plaintext` does the same install with an UNENCRYPTED
+  store: every file readable in a text editor, by you and by any person or
+  program with access to the folder. It is a real choice, stated plainly, not
+  a hidden downgrade. A store that started plaintext can adopt encryption
+  later with `fimemory encrypt` (cheapest before real content accumulates).
 
 Before, a working install and a dead one looked identical. Now the install tells
 you which one you have.
@@ -285,12 +300,13 @@ missing or does not list notes that are on disk is a failure, not a warning:
 search reads the index, so a blind index means an assistant quietly finds
 nothing.
 
-## Encryption at rest (optional)
+## Encryption at rest (the default)
 
-`fimemory setup --encrypted` (or `fimemory encrypt` later, on a store you
-already have) seals the store with XChaCha20-Poly1305 behind an Argon2id
-passphrase, and prints a 24-word recovery phrase once. Lose both the passphrase
-and that phrase and the data is gone, by design.
+New stores are sealed with XChaCha20-Poly1305 behind an Argon2id passphrase,
+and a 24-word recovery phrase prints once at creation (`fimemory encrypt`
+brings an older or `--plaintext` store into the same state). Lose both the
+passphrase and that phrase and the data is gone, by design. There is no
+account and no reset, which is exactly why the phrase matters.
 
 Tools open the store with `GESTALT_PASSPHRASE`. Set it the way your own shell
 wants it:
@@ -303,6 +319,16 @@ GESTALT_PASSPHRASE='your passphrase here' fimemory list   # macOS, Linux
 
 One unlock keeps commands fast for about 8 hours (`sessionKeyCacheTtlHours`,
 0 disables it). `fimemory lock` ends it early.
+
+The day-2 truth, so nothing surprises you: when that window expires and no
+passphrase is in the environment, CLI commands ask again, MCP tools answer
+every call with a clear "store is locked" error that names the fix (set
+`GESTALT_PASSPHRASE` where the tool runs, or `fimemory unlock` in any
+terminal; a running server picks the unlock up on its next call, no
+restart), and the per-prompt retrieval hook stays silent rather than blocking
+your prompt. `fimemory doctor` is what names THAT state out loud. GUI apps
+(Claude Desktop and friends) read the OS user environment, not your shell
+profile, so put the variable where the desktop session sees it.
 
 Honesty about the boundary: once your store is unlocked, a connected MCP client
 has read access equivalent to a filesystem tool. That is true of every memory

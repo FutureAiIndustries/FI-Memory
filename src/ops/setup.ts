@@ -579,11 +579,12 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
     );
   }
   if (created && !mnemonic) {
-    // A plaintext store should be a decision, not a default the user was never
-    // shown. `encrypt` migrates in place, so choosing later is cheap — but
-    // only if the user knows the fork exists before the store fills up.
+    // Since 0.5 the CLI defaults new stores to encrypted, so a plaintext store
+    // that was CREATED is a decision somebody made (--plaintext, or a library
+    // caller). State the standing cost once, and that reversing it is cheap —
+    // cheapest before real content accumulates.
     nextSteps.push(
-      `${BIN} encrypt    # optional: encrypt the store at rest (prints a 24-word recovery phrase ONCE — store it off this machine). Cheapest before real content accumulates.`,
+      `${BIN} encrypt    # this store is PLAINTEXT — readable by any person or program with file access. \`encrypt\` seals it in place (prints a 24-word recovery phrase ONCE — store it off this machine). Cheapest before real content accumulates.`,
     );
   }
   if (created) {

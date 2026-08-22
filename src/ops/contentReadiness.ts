@@ -3,6 +3,9 @@ import path from "node:path";
 import { loadConfig } from "../config.js";
 import { EXAMPLE_ID } from "../example.js";
 import { fsPath, storePaths } from "../paths.js";
+import { peekSessionDek } from "../sessionKeyCache.js";
+import { activateDek, clearActiveKey, decryptFile, keyState } from "../store/codec.js";
+import { assertEnvKeyMatchesStore } from "../store/keyring.js";
 import { parseLog } from "../store/log.js";
 import { NOTE_TEMPLATE_MARKER, parseNote } from "../store/note.js";
 import { asString, parseYaml, splitFrontmatter } from "../store/frontmatter.js";
@@ -21,9 +24,11 @@ import { SEED_AGENT, SEED_TOPIC_IDS } from "./seed.js";
  * so an empty store is a search tax, strictly worse than no store.
  *
  * This module answers the content question with the same discipline doctor
- * applies to everything else: read-only, plaintext-stores-only (doctor never
- * derives keys, so an encrypted store reports "not assessed" rather than a
- * comparison that was not made), and every threshold named.
+ * applies to everything else: read-only, never deriving a key, and every
+ * threshold named. Plaintext stores are scanned directly; an encrypted store
+ * is scanned only when a NON-DERIVING key source is at hand
+ * (`assessContentSealed` — in-process key or warm session cache), and reports
+ * "not assessed" otherwise rather than a comparison that was not made.
  *
  * WHAT COUNTS AS "REAL". Seed topics and the worked example ship with every
  * store and are stamped `agent: gestalt-runtime` (SEED_AGENT) — as are the
@@ -94,8 +99,12 @@ const NOT_ASSESSED: Omit<ContentReadiness, "assessed" | "reason"> = {
  * all. Parse-level damage is doctor's index checks' job to REPORT; this scan
  * only answers "is there user content".
  */
-export function assessContent(home: string): ContentReadiness {
+export function assessContent(
+  home: string,
+  opts: { decoded?: boolean } = {},
+): ContentReadiness {
   const paths = storePaths(home);
+  const decoded = opts.decoded === true;
   let maxPendingProposals: number;
   try {
     maxPendingProposals = loadConfig(paths.config).config.maxPendingProposals;
@@ -108,7 +117,13 @@ export function assessContent(home: string): ContentReadiness {
   const realTopics: string[] = [];
   let topicsTotal = 0;
   let curatedRealTopic = false;
-  for (const { id, text } of readDir(paths.topicsDir, ".md")) {
+  let decodeFailures = 0;
+  const dir = (d: string, ext: string): Array<{ id: string; text: string }> => {
+    const r = readDir(d, ext, decoded);
+    decodeFailures += r.decodeFailures;
+    return r.entries;
+  };
+  for (const { id, text } of dir(paths.topicsDir, ".md")) {
     const note = parseNote(text, id);
     if (!note) continue; // unparsable notes are doctor's `notes_unparsable` finding, not ours
     topicsTotal += 1;
@@ -122,7 +137,7 @@ export function assessContent(home: string): ContentReadiness {
 
   // ── Logs: entries the runtime did not write itself ────────────────────────
   let realLogEntries = 0;
-  for (const { id, text } of readDir(paths.logsDir, ".log.md")) {
+  for (const { id, text } of dir(paths.logsDir, ".log.md")) {
     // parseLog THROWS on a mode/key mismatch — a stale GESTALT_KEY over a
     // plaintext store, or a hand-edited line its encrypted-shape heuristic
     // trips on (log.ts's own §0.1 example). doctor is gate-exempt, so nothing
@@ -144,7 +159,7 @@ export function assessContent(home: string): ContentReadiness {
   let pendingProposals = 0;
   let oldestPendingCreated: string | null = null;
   let seedProposalPending = false;
-  for (const { text } of readDir(paths.proposalsDir, ".md")) {
+  for (const { text } of dir(paths.proposalsDir, ".md")) {
     const split = splitFrontmatter(text);
     if (!split) continue;
     const data = parseYaml(split.yaml);
@@ -160,6 +175,17 @@ export function assessContent(home: string): ContentReadiness {
     // as SEED_AGENT. If example.ts ever changes its proposer, this match must
     // move with it.
     if (asString(data["proposer"]) === SEED_AGENT) seedProposalPending = true;
+  }
+
+  // A sealed file the available key could not open means the numbers above are
+  // not the store's numbers. "Assessed, empty" over an unreadable store is a
+  // WRONG report delivered confidently — the exact defect this module's
+  // not-assessed contract exists to prevent. (A stale key mid-rotation and a
+  // mixed-mode store both land here; doctor's own findings name those.)
+  if (decoded && decodeFailures > 0) {
+    return notAssessed(
+      `${String(decodeFailures)} sealed file(s) could not be decoded with the available key — content was not inspected`,
+    );
   }
 
   return {
@@ -185,22 +211,79 @@ export function notAssessed(reason: string): ContentReadiness {
 
 /** Yield `{id, text}` for every `*.<ext>` file in `dir`; missing or unreadable
  * dirs yield nothing (a store with no proposals/ yet is not a finding). */
-function readDir(dir: string, ext: string): Array<{ id: string; text: string }> {
+function readDir(
+  dir: string,
+  ext: string,
+  decode = false,
+): { entries: Array<{ id: string; text: string }>; decodeFailures: number } {
   let files: string[];
   try {
     files = readdirSync(fsPath(dir));
   } catch {
-    return [];
+    return { entries: [], decodeFailures: 0 };
   }
-  const out: Array<{ id: string; text: string }> = [];
+  const entries: Array<{ id: string; text: string }> = [];
+  let decodeFailures = 0;
   for (const f of files) {
     if (!f.endsWith(ext)) continue;
+    const full = path.join(dir, f);
+    let raw: string;
     try {
-      out.push({ id: path.basename(f, ext), text: readFileSync(fsPath(path.join(dir, f)), "utf8") });
+      raw = readFileSync(fsPath(full), "utf8");
     } catch {
       // Unreadable file: skip. Parse-level damage is reported by doctor's
       // index checks; this scan only answers "is there user content".
+      continue;
+    }
+    if (!decode) {
+      entries.push({ id: path.basename(f, ext), text: raw });
+      continue;
+    }
+    // The sealed path (0.5): route the bytes through the codec — identity for
+    // kinds that are not whole-file sealed (logs decode per entry inside
+    // parseLog), decrypt-or-throw for notes and proposals. A file the key
+    // cannot open is COUNTED, not skipped: the caller downgrades the whole
+    // report to not-assessed rather than presenting a partial count as truth.
+    try {
+      entries.push({ id: path.basename(f, ext), text: decryptFile(full, raw) });
+    } catch {
+      decodeFailures += 1;
     }
   }
-  return out;
+  return { entries, decodeFailures };
+}
+
+/**
+ * Content assessment for an ENCRYPTED store doctor already judged unlocked —
+ * without ever deriving a key (doctor's standing promise). Two non-deriving
+ * sources, in trust order: a key that is already in-process (an activated DEK
+ * — the interactive-onboard case — or the GESTALT_KEY doctor validated), else
+ * the warm session cache, read by pure PEEK (doctor never writes — no sweep,
+ * no wipe) and given the same verify-before-trust the CLI gate applies; the
+ * process key state is restored afterwards.
+ *
+ * Before 0.5 every encrypted store reported "content: not assessed" forever —
+ * with encryption the DEFAULT, that meant the Content half of the product's
+ * own scoreboard (doctor, onboard's two scores, `content_empty`) simply never
+ * ran for a new user. This is the repair.
+ */
+export function assessContentSealed(home: string, ttlMs: number): ContentReadiness {
+  if (keyState().mode !== "plaintext") {
+    return assessContent(home, { decoded: true });
+  }
+  const hex = ttlMs > 0 ? peekSessionDek(home, Date.now(), { ttlMs }) : null;
+  if (hex === null) {
+    return notAssessed("encrypted store — the warm session key expired mid-report; unlock and run doctor again");
+  }
+  try {
+    assertEnvKeyMatchesStore(home, hex);
+  } catch {
+    return notAssessed("encrypted store — the cached session key does not open it");
+  }
+  activateDek(Uint8Array.from(Buffer.from(hex, "hex")));
+  try {
+    return assessContent(home, { decoded: true });
+  } finally {
+    clearActiveKey();
+  }
 }

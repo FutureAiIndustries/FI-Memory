@@ -223,14 +223,22 @@ export async function joinStore(opts: JoinOptions): Promise<JoinResult> {
 
   const keyringGuide: string[] = [];
   if (encrypted && !keyringPresent) {
+    // The 24-word phrase LEADS (measured 2026-08-01, TEAM-PLAYBOOK correction):
+    // `recover` rebuilds keyring.json from the phrase alone, so a second
+    // machine needs only the repo + the phrase — the keyring file never has to
+    // travel. Copying the keyring is the fallback for someone who holds the
+    // passphrase but not the phrase.
     keyringGuide.push(
       "This store is encrypted, and keyring.json is NOT in the clone (it is gitignored on purpose).",
-      "The passphrase alone cannot open a fresh clone. Get keyring.json from the owner OUT OF BAND",
-      "(password manager or in person — never chat an AI can read, never the git remote).",
-      "Then either:",
+      "The passphrase alone cannot open a fresh clone. The simplest way in is the 24-word recovery phrase:",
+      "  fimemory recover --mnemonic \"...\" --passphrase \"<a new passphrase for THIS machine>\"",
+      "  # rebuilds keyring.json right here — nothing has to travel except the phrase (keep it offline)",
+      "Or, if you have the keyring file instead: get keyring.json from the owner OUT OF BAND",
+      "(password manager or in person — never chat an AI can read, never the git remote), then:",
       "  fimemory join <git-url> --keyring /path/to/keyring.json",
       "  # or: place keyring.json in the store root by hand, then re-run join / unlock",
-      "Alternatively, if you have the 24-word recovery phrase: fimemory recover --mnemonic \"...\" --passphrase \"<new>\"",
+      "Then, in order: fimemory unlock  →  fimemory reindex (if join deferred it)  →  fimemory pull",
+      "(`pull` refuses while the store is locked — the conflict resolver never runs without a key).",
     );
     warnings.push(
       "keyring.json missing — passphrase alone cannot open this clone. Import it out of band (see guide).",

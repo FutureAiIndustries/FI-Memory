@@ -1,8 +1,11 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { runInit } from "../src/commands/init.js";
 import { assessContent, notAssessed } from "../src/ops/contentReadiness.js";
+import { writeSessionCache } from "../src/sessionKeyCache.js";
+import { clearActiveKey, keyState } from "../src/store/codec.js";
+import { unlockWithPassphrase } from "../src/store/keyring.js";
 import { appendLog } from "../src/ops/logOp.js";
 import { createTopic } from "../src/ops/create.js";
 import { runDoctor } from "../src/ops/doctor.js";
@@ -213,5 +216,104 @@ describe("doctor carries the second score without touching the exit contract", (
     expect(f!.level).toBe("warn");
     expect(f!.message).toMatch(/1 of 1/);
     expect(f!.hint).toContain("review");
+  });
+});
+
+describe("assessContentSealed — the Content score no longer goes dark on encrypted stores (0.5)", () => {
+  const PASS = "a perfectly sturdy sealed-content passphrase";
+  const TINY = { name: "argon2id", m: 256, t: 1, p: 1 } as const;
+
+  function withEnv<T>(vars: Record<string, string | undefined>, fn: () => T): T {
+    const saved: Record<string, string | undefined> = {};
+    for (const [k, v] of Object.entries(vars)) {
+      saved[k] = process.env[k];
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    try {
+      return fn();
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  }
+
+  function encryptedStore(label: string): { home: string; dek: Uint8Array } {
+    const home = freshHome(label);
+    runInit({ home, encrypted: true, passphrase: PASS, argon2: TINY, allowWeakParams: true });
+    const dek = unlockWithPassphrase(home, PASS);
+    clearActiveKey();
+    return { home, dek };
+  }
+
+  it("warm session cache: doctor ASSESSES content — and still writes nothing, not even the cache sweep", () => {
+    const sessionDir = path.join(freshHome("sealed-warm-sess"), "session-keys");
+    withEnv({ GESTALT_SESSION_DIR: sessionDir }, () => {
+      const { home, dek } = encryptedStore("sealed-warm");
+      writeSessionCache(home, dek, 3_600_000);
+      clearActiveKey();
+      const cacheFile = readdirSync(sessionDir).map((f) =>
+        readFileSync(path.join(sessionDir, f), "utf8"),
+      );
+
+      const r = doctorOn(home);
+      expect(r.mode).toBe("encrypted-unlocked");
+      expect(r.content.assessed).toBe(true);
+      // A fresh encrypted store: the worked example only, nothing of the user's.
+      expect(r.content.hasUserContent).toBe(false);
+      expect(r.content.topicsTotal).toBeGreaterThan(0);
+      // Doctor never writes — the peek path must not sweep or wipe.
+      expect(
+        readdirSync(sessionDir).map((f) => readFileSync(path.join(sessionDir, f), "utf8")),
+      ).toEqual(cacheFile);
+      // No key may linger in-process after the report.
+      expect(keyState().mode).toBe("plaintext");
+    });
+  });
+
+  it("a stale cached key that does not open the store downgrades to not-assessed — never a confident wrong count", () => {
+    const sessionDir = path.join(freshHome("sealed-stale-sess"), "session-keys");
+    withEnv({ GESTALT_SESSION_DIR: sessionDir }, () => {
+      const { home } = encryptedStore("sealed-stale");
+      // A cache entry for this store holding a DIFFERENT store's key.
+      writeSessionCache(home, new Uint8Array(32).fill(7), 3_600_000);
+      clearActiveKey();
+
+      const r = doctorOn(home);
+      expect(r.mode).toBe("encrypted-unlocked"); // freshness peek cannot know the key is wrong
+      expect(r.content.assessed).toBe(false);
+      expect(r.content.reason).toMatch(/does not open/);
+    });
+  });
+
+  it("a plaintext file smuggled into a sealed store poisons the count — so the count is refused", () => {
+    const sessionDir = path.join(freshHome("sealed-mixed-sess"), "session-keys");
+    withEnv({ GESTALT_SESSION_DIR: sessionDir }, () => {
+      const { home, dek } = encryptedStore("sealed-mixed");
+      writeSessionCache(home, dek, 3_600_000);
+      clearActiveKey();
+      writeFileSync(
+        path.join(home, "topics", "smuggled.md"),
+        "# smuggled\n\nA plaintext note inside a sealed store.\n",
+        "utf8",
+      );
+
+      const r = doctorOn(home);
+      expect(r.content.assessed).toBe(false);
+      expect(r.content.reason).toMatch(/could not be decoded/);
+    });
+  });
+
+  it("LOCKED stays honest: no key source, no content claim", () => {
+    const sessionDir = path.join(freshHome("sealed-locked-sess"), "session-keys");
+    withEnv({ GESTALT_SESSION_DIR: sessionDir }, () => {
+      const { home } = encryptedStore("sealed-locked");
+      const r = doctorOn(home);
+      expect(r.mode).toBe("encrypted-locked");
+      expect(r.content.assessed).toBe(false);
+      expect(r.content.reason).toMatch(/LOCKED/);
+    });
   });
 });

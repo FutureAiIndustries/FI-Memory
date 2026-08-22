@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { readEnv } from "../brand.js";
 import { DEFAULT_CONFIG, serializeConfig } from "../config.js";
 import { GestaltError } from "../errors.js";
 import type { Warning } from "../errors.js";
@@ -185,8 +186,12 @@ export function runInit(opts: InitOptions = {}): InitResult {
         "Unset GESTALT_KEY, then create the passphrase-managed store.",
       );
     }
+    // readEnv, not a raw GESTALT_PASSPHRASE read: the unlock gate and the
+    // seed both honour FIMEMORY_PASSPHRASE with GESTALT_ as the legacy
+    // fallback, and init honouring only the legacy name meant the one command
+    // that CREATES the store disagreed with every command that opens it.
     const passphrase =
-      opts.passphrase ?? (opts.env ?? process.env).GESTALT_PASSPHRASE;
+      opts.passphrase ?? readEnv("PASSPHRASE", opts.env ?? process.env);
     if (!passphrase) {
       rollbackSkeleton();
       throw new GestaltError(
@@ -233,8 +238,10 @@ export function runInit(opts: InitOptions = {}): InitResult {
   // mode 0600 on every file this creates. Under umask 022 an unmoded
   // writeFileSync lands 0644, and because writeFileAtomicPlain PRESERVES an
   // existing mode, every later write through the runtime would keep the store's
-  // notes world-readable for the life of the store. The default install is a
-  // PLAINTEXT store, so on POSIX these bytes are the user's memory in the clear.
+  // notes world-readable for the life of the store. Since 0.5 the CLI defaults
+  // NEW stores to encrypted, but plaintext stores remain first-class (the
+  // --plaintext opt-out, this library's own default, every pre-0.5 store), so
+  // on POSIX these bytes can still be the user's memory in the clear.
   // Inert on Windows. Measured on the POSIX legs by .github/scripts/posix-modes.mjs.
   const write = (p: string, content: string): void => {
     writeFileSync(fsPath(p), encryptFile(p, content), { encoding: "utf8", mode: 0o600 });

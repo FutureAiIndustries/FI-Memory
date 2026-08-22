@@ -429,6 +429,20 @@ export function readSessionCache(
   } catch {
     return null; // absent — the normal cold state
   }
+  const dek = validSessionDek(raw, home, now, opts.ttlMs);
+  if (dek !== null) return dek;
+  wipeSessionCache(home); // expired/corrupt/foreign — remove it, fall back quietly
+  return null;
+}
+
+/** The one definition of "this cache entry is live and this store's" — shared
+ * by the reading path (which repairs) and the peeking path (which must not). */
+function validSessionDek(
+  raw: string,
+  home: string,
+  now: number,
+  ttlMs?: number,
+): string | null {
   try {
     const entry = JSON.parse(raw) as SessionCacheEntry;
     if (
@@ -440,16 +454,35 @@ export function readSessionCache(
       HEX64.test(entry.dek) &&
       typeof entry.expires === "number" &&
       now < entry.expires &&
-      (opts.ttlMs === undefined ||
-        (typeof entry.created === "number" && now < entry.created + opts.ttlMs))
+      (ttlMs === undefined ||
+        (typeof entry.created === "number" && now < entry.created + ttlMs))
     ) {
       return entry.dek;
     }
   } catch {
-    /* unparsable → treated as expired below */
+    /* unparsable → invalid */
   }
-  wipeSessionCache(home); // expired/corrupt/foreign — remove it, fall back quietly
   return null;
+}
+
+/**
+ * The warm DEK, read WITHOUT `readSessionCache`'s sweep-and-wipe side effects.
+ * Doctor's sealed content pass (0.5) needs the key itself, and doctor never
+ * writes — a stale or corrupt entry is simply null here and stays on disk for
+ * the next REAL unlock to clear.
+ */
+export function peekSessionDek(
+  home: string,
+  now: number = Date.now(),
+  opts: { ttlMs?: number } = {},
+): string | null {
+  let raw: string;
+  try {
+    raw = readFileSync(sessionCachePath(home), "utf8");
+  } catch {
+    return null;
+  }
+  return validSessionDek(raw, home, now, opts.ttlMs);
 }
 
 /** What a read-only observer may know about the cache for one store. Never
