@@ -13,6 +13,7 @@ import { readEnv } from "../brand.js";
 import { loadConfig } from "../config.js";
 import { GestaltError } from "../errors.js";
 import type { HomeOpts } from "../paths.js";
+import { atomicTempBase, isAtomicTemp } from "../store/tmpResidue.js";
 import { fsPath, resolveHome, storePaths, topicLogPath } from "../paths.js";
 import { activateDek, clearActiveKey, decryptFile, encryptFile } from "../store/codec.js";
 import {
@@ -216,6 +217,9 @@ const PRESERVED = new Set([
 
 /** The transient write lock (a directory, created by proper-lockfile). Never carried. */
 const LOCKFILE_NAME = ".gestalt.lock";
+/** The lock plus its D7 owner-record sibling (0.4) — machinery, never content. */
+const isLockMachinery = (name: string): boolean =>
+  name === LOCKFILE_NAME || name === `${LOCKFILE_NAME}.owner`;
 
 /**
  * The EXACT atomic-write temp name that `store/atomic.ts` produces:
@@ -232,14 +236,8 @@ const LOCKFILE_NAME = ".gestalt.lock";
  * both `copyPreservedEntries` (the carry) and `assertNoLeakedEntries` (the audit)
  * route through it, so fixing it here closes the class in every path at once.
  */
-const ATOMIC_TEMP_RE = /^\.([^\\/]+)\.tmp-\d+-\d+$/;
-const isAtomicTemp = (name: string): boolean => ATOMIC_TEMP_RE.test(name);
-
-/** The `<base>` captured from an atomic-write temp name, or null if not one. */
-function atomicTempBase(name: string): string | null {
-  const m = ATOMIC_TEMP_RE.exec(name);
-  return m ? m[1]! : null;
-}
+// The classifier itself moved to store/tmpResidue.ts, shared with the D5
+// janitor — one definition for the whole file-drop class, imported at the top.
 
 /**
  * The root store files that are atomically (re)written — a `.<base>.tmp-*` for one
@@ -898,7 +896,7 @@ function copyPreservedEntries(home: string, staging: string, warn: (msg: string)
   for (const entry of readdirSync(fsPath(home), { withFileTypes: true })) {
     const name = entry.name;
     if (REGENERATED_STAGED.has(name)) continue; // regenerated sealed into staging
-    if (name === LOCKFILE_NAME || sibRe.test(name)) continue; // transient / scoped residue
+    if (isLockMachinery(name) || sibRe.test(name)) continue; // transient / scoped residue
     const tempBase = atomicTempBase(name);
     if (tempBase !== null) {
       // An atomic-write temp: skip it (carrying one would plant stray PLAINTEXT beside
@@ -958,7 +956,7 @@ function copyNonCanonicalContentEntries(
     }
     for (const name of names) {
       if (isCanonicalContentFile(name, suffix)) continue; // regenerated + sealed separately
-      if (name === LOCKFILE_NAME || sibRe.test(name)) continue; // transient / scoped residue
+      if (isLockMachinery(name) || sibRe.test(name)) continue; // transient / scoped residue
       if (atomicTempBase(name) !== null) {
         // An atomic-write temp: skip it (carrying one would plant stray PLAINTEXT
         // beside the sealed copy). Unlike the root, a content-dir write-temp base

@@ -545,6 +545,37 @@ describe("whole-file conflicts, log unions and the refusals", () => {
     expect(report.findings.map((f) => f.code)).not.toContain("store_conflict_markers");
   }, 90_000);
 
+  it("T5b (0.4) — a conflicted schema.json resolves to the HIGHER format, never 'ours'", async () => {
+    // The fleet-disarm case: 'ours stays live' let a v1 machine keep v1 live
+    // against the fleet's v2 bump and park the bump where nothing reads it —
+    // silently disarming the skew gate fleet-wide. Version resolution is max.
+    const p = await buildPair("wd-schema", false);
+    const schemaPath = (home: string): string => fsPath(storePaths(home).schema);
+    // Both sides rewrite schema.json differently so git conflicts on it.
+    // (Values here stay <= CLIENT_SCHEMA_VERSION so the resolver's own
+    // phase-3 writes are not refused by the very gate this protects.)
+    writeFileSync(schemaPath(p.a), JSON.stringify({ schema_version: 1, min_reader: 1 }, null, 4) + "\n", "utf8");
+    commitAll(p, p.a, "machine-a: schema formatting");
+    git(p, p.a, "push", "-q", "origin", "main");
+    writeFileSync(schemaPath(p.b), JSON.stringify({ schema_version: 1, min_reader: 1 }) + "\n", "utf8");
+    commitAll(p, p.b, "machine-b: schema formatting");
+
+    expect(rawPull(p, p.b).ok).toBe(false);
+    expect(conflicted(p.b, p.env)).toContain("schema.json");
+
+    const res = await resolveConflicts(p.b, { env: p.env, now: clockAt(RESOLVE_AT) });
+    git(p, p.b, "commit", "-q", "--no-edit");
+
+    // Both sides parse → the live file is the canonical serialization at
+    // max(ours, theirs), nothing parks, and the resolution says why.
+    const live = JSON.parse(readFileSync(schemaPath(p.b), "utf8")) as { schema_version: number };
+    expect(live.schema_version).toBe(1);
+    expect(res.parked).toHaveLength(0);
+    expect(res.advisories.some((a) => a.includes("schema.json conflict resolved to format"))).toBe(true);
+    expect(filesWithMarkers(p.b)).toEqual([]);
+    expect(conflicted(p.b, p.env)).toEqual([]);
+  }, 90_000);
+
   it("T9-adjacent — a log conflict on a store MISSING the union lines still unions, in order", async () => {
     const p = await buildPair("wd-nounion", false);
     // Strip the two merge=union lines, exactly the shape of a store that
@@ -820,7 +851,11 @@ describe("whole-file conflicts, log unions and the refusals", () => {
     expect(await liveBody(p.b, "alpha")).toContain("Owner note from machine B.");
   }, 90_000);
 
-  it("a delete/modify conflict on a note REFUSES rather than inventing a policy", async () => {
+  it("delete/modify on a note keeps the EDIT live and says the deletion out loud (0.4; was a refusal)", async () => {
+    // Through 0.3.x this shape refused and handed the user raw git — the one
+    // conflict with no product flow. The 0.4 rule comes from the resolver's own
+    // charter: content outranks deletion, because a suppressed delete is one
+    // deliberate delete away from restored intent while a dropped edit is gone.
     const p = await buildPair("wd-deletemod", false);
     git(p, p.a, "rm", "-q", "--", "topics/alpha.md");
     git(p, p.a, "commit", "-q", "-m", "machine-a: delete alpha");
@@ -833,17 +868,89 @@ describe("whole-file conflicts, log unions and the refusals", () => {
     commitAll(p, p.b, "machine-b: edit alpha");
     expect(rawPull(p, p.b).ok).toBe(false);
 
-    const before = hashTree(p.b);
-    const err = await expectGestaltErrorAsync(
-      () => resolveConflicts(p.b, { env: p.env, now: clockAt(RESOLVE_AT) }),
-      "E_SCHEMA",
+    const res = await resolveConflicts(p.b, { env: p.env, now: clockAt(RESOLVE_AT) });
+    git(p, p.b, "commit", "-q", "--no-edit");
+
+    // The edit survives, canonical, marker-free — and no proposal is minted
+    // (there is no second body to file; the deletion is intent, not content).
+    const live = await readText(topicNotePath(p.b, "alpha"));
+    expect(live).toContain("B kept editing it");
+    expect(filesWithMarkers(p.b)).toEqual([]);
+    expect(conflicted(p.b, p.env)).toEqual([]);
+
+    // Loud, twice: an advisory the caller must print, and a provenance log
+    // entry search can find — never a silent un-delete.
+    expect(res.advisories.join("\n")).toContain("DELETED on the other machine");
+    const logText = (await readText(topicLogPath(p.b, "alpha")))!;
+    expect(logText).toContain("suppressed");
+
+    // And the OTHER direction: ours deleted, theirs edited — the edit returns.
+    git(p, p.b, "push", "-q", "origin", "main");
+    const q = await buildPair("wd-deletemod-rev", false);
+    git(q, q.a, "rm", "-q", "--", "topics/alpha.md");
+    git(q, q.a, "commit", "-q", "-m", "machine-a deletes");
+    const noteB = parseNote((await readText(topicNotePath(q.b, "alpha")))!, "alpha")!;
+    await writeFileAtomic(
+      topicNotePath(q.b, "alpha"),
+      serializeNote({ ...noteB, updated: new Date(T0 + 60_000).toISOString(), body: editBody(noteB.body, "the other side kept it alive") }),
     );
-    // A deletion has no `updated:`, so the winner rule has nothing to compare —
-    // either choice would silently un-delete or silently delete somebody's note.
-    expect(err.message).toContain("DELETED");
-    expect(err.message).toContain("Nothing was written");
-    expect(hashTree(p.b)).toEqual(before);
-    expect(inProgress(p.b, p.env)).toBe("merge");
+    commitAll(q, q.b, "machine-b edits");
+    git(q, q.b, "push", "-q", "origin", "main");
+    expect(rawPull(q, q.a).ok).toBe(false);
+    const resA = await resolveConflicts(q.a, { env: q.env, now: clockAt(RESOLVE_AT) });
+    git(q, q.a, "commit", "-q", "--no-edit");
+    expect(await readText(topicNotePath(q.a, "alpha"))).toContain("the other side kept it alive");
+    expect(resA.advisories.join("\n")).toContain("DELETED on this machine");
+  }, 120_000);
+
+  it("add/add — both machines independently CREATE the same topic id; the winner rule handles it like modify/modify (0.4 pin)", async () => {
+    // The resolver never reads stage :1:, so add/add is code-path-identical to
+    // modify/modify — but until this pin nothing proved it, and the largest
+    // untested shape on the fleet is two machines coining the same topic name.
+    const p = await buildPair("wd-addadd", false);
+    const mk = async (home: string, phrase: string, ms: number): Promise<void> => {
+      await createTopic(home, "coined-twice", "Coined Twice", { now: clockAt(ms) });
+      const n = parseNote((await readText(topicNotePath(home, "coined-twice")))!, "coined-twice")!;
+      await writeFileAtomic(
+        topicNotePath(home, "coined-twice"),
+        serializeNote({ ...n, updated: new Date(ms + 1_000).toISOString(), body: `\n${phrase}\n\n## Owner notes\n` }),
+      );
+    };
+    await mk(p.a, "the albatross version from machine A", T0 + 70_000);
+    commitAll(p, p.a, "machine-a coins the topic");
+    git(p, p.a, "push", "-q", "origin", "main");
+    await mk(p.b, "the osprey version from machine B", T0 + 80_000);
+    commitAll(p, p.b, "machine-b coins the topic");
+    expect(rawPull(p, p.b).ok).toBe(false);
+
+    const res = await resolveConflicts(p.b, { env: p.env, now: clockAt(RESOLVE_AT) });
+    git(p, p.b, "commit", "-q", "--no-edit");
+
+    // Newer updated: wins (B); A's body is filed, findable, never dropped.
+    expect(await readText(topicNotePath(p.b, "coined-twice"))).toContain("osprey");
+    const mintedSeqs = res.notes.filter((n) => n.proposal !== null);
+    expect(mintedSeqs.length).toBe(1);
+    expect(filesWithMarkers(p.b)).toEqual([]);
+    const hits = await search(p.b, "albatross");
+    expect(hits.hits.length).toBeGreaterThan(0);
+  }, 120_000);
+
+  it("delete-vs-edit on a LOG resurrects the deleted side BY DESIGN — append-only stores do not honor log deletion (0.4 pin)", async () => {
+    // unionLog skips a missing side, so a deleted log grows back from the
+    // survivor. For an append-only structure that is the intended contract —
+    // pinned here so the behavior is a decision, not an accident.
+    const p = await buildPair("wd-logdelete", false);
+    git(p, p.a, "rm", "-q", "--", "logs/alpha.log.md");
+    git(p, p.a, "commit", "-q", "-m", "machine-a: delete alpha log");
+    git(p, p.a, "push", "-q", "origin", "main");
+    await appendLog(p.b, "alpha", { type: "gotcha", project: "t", agent: "b", summary: "kingfisher survives the deletion" }, { now: clockAt(T0 + 90_000) });
+    commitAll(p, p.b, "machine-b: logs on");
+    expect(rawPull(p, p.b).ok).toBe(false);
+    await resolveConflicts(p.b, { env: p.env, now: clockAt(RESOLVE_AT) });
+    git(p, p.b, "commit", "-q", "--no-edit");
+    const logText = (await readText(topicLogPath(p.b, "alpha")))!;
+    expect(logText).toContain("kingfisher survives the deletion");
+    expect(filesWithMarkers(p.b)).toEqual([]);
   }, 90_000);
 
   it("a side that is ALREADY a half-merged file refuses, rather than electing a Frankenstein body", async () => {

@@ -1,6 +1,7 @@
 import { loadConfig } from "../config.js";
 import type { Warning } from "../errors.js";
 import { storePaths, topicLogPath, topicNotePath } from "../paths.js";
+import { warnStoreReadable } from "../store/schema.js";
 import { recordServed } from "../session.js";
 import { countTokens } from "../tokens.js";
 import { loadIndexOrEmpty } from "../store/index.js";
@@ -61,6 +62,10 @@ export async function search(
   const queryPhrase = tokens.length > 1 ? tokens.join(" ") : null;
 
   const warnings: Warning[] = [];
+  // 0.4: min_reader finally has behavior — a warning, never a refusal. Reads
+  // stay permissive; what ends is the silence about possibly-misread content.
+  const readable = warnStoreReadable(home);
+  if (readable) warnings.push({ code: "schema_min_reader", message: readable });
   const index = await loadIndexOrEmpty(home);
   const andHits: SearchHit[] = [];
   const orHits: SearchHit[] = [];

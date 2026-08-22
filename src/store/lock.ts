@@ -1,7 +1,105 @@
+import { readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import lockfile from "proper-lockfile";
 import { GestaltError } from "../errors.js";
 import { fsPath, storePaths } from "../paths.js";
 import { assertStoreWritable } from "./schema.js";
+
+/**
+ * D7 — LIVENESS RECLAIM (fixed 2026-08-21; registry docs/DEFECT-REGISTRY.md).
+ *
+ * proper-lockfile's staleness is mtime-only, so a holder hard-killed (SIGKILL,
+ * Windows TerminateProcess, OOM) leaves `.gestalt.lock` with a fresh mtime and
+ * wedges every other tool's writes with E_LOCKED for up to the 60 s stale
+ * window. The fix: the holder writes a SIBLING owner record (never inside the
+ * lock dir — proper-lockfile removes the dir with rmdir on three paths, and a
+ * file inside breaks all three with ENOTEMPTY), and a refused contender may
+ * steal a lock whose recorded owner is PROVABLY dead.
+ *
+ * The steal rule is deliberately conservative — a false steal is the one way
+ * this code can lose data (two writers interleaving in one store):
+ *  - no owner record            → today's mtime semantics (wait it out). This
+ *    keeps a user-mkdir'd or third-party lock exactly as it behaved before.
+ *  - record from ANOTHER host   → never steal (an SMB-shared store home defeats
+ *    pid liveness; the hostname gate is what keeps the oracle sound).
+ *  - kill(pid, 0) throws EPERM  → ALIVE (a live other-user process; registry
+ *    D5/D7 caveat), never steal.
+ *  - pid alive                  → never steal, even though pids recycle —
+ *    the worst case of that caution is the status quo, a ≤60 s wait.
+ *  - lock dir mtime < GRACE     → not yet: a brand-new mkdir may be a fresh
+ *    holder that has not written its owner record over a crashed one's leavings
+ *    yet. Dead-crash steals just wait out the 2 s grace instead of 60.
+ *  - only ESRCH on a same-host record past the grace window steals: unlink the
+ *    record, remove the lock dir, take one immediate re-acquire attempt.
+ */
+interface LockOwnerRecord {
+  pid: number;
+  /** Date.now() - uptime at acquisition — identifies the holder process
+   * generation so a future reader can spot pid recycling. */
+  processStartTime: number;
+  host: string;
+  acquiredAt: number;
+}
+
+const STEAL_GRACE_MS = 2_000;
+
+function ownerRecordPath(lockPath: string): string {
+  return `${lockPath}.owner`;
+}
+
+/** Best-effort — a lock without a record degrades to mtime semantics, which is
+ * the pre-fix behavior, never worse. */
+function writeOwnerRecord(lockPath: string): void {
+  const record: LockOwnerRecord = {
+    pid: process.pid,
+    processStartTime: Math.round(Date.now() - process.uptime() * 1000),
+    host: os.hostname(),
+    acquiredAt: Date.now(),
+  };
+  try {
+    writeFileSync(ownerRecordPath(lockPath), JSON.stringify(record), "utf8");
+  } catch {
+    /* degrade to mtime semantics */
+  }
+}
+
+function removeOwnerRecord(lockPath: string): void {
+  try {
+    unlinkSync(ownerRecordPath(lockPath));
+  } catch {
+    /* already gone, or degrade */
+  }
+}
+
+/** True only when the record proves the holder dead and the lock was removed —
+ * the caller then gets exactly one immediate re-acquire attempt. */
+function tryStealDeadLock(lockPath: string): boolean {
+  try {
+    const raw = readFileSync(ownerRecordPath(lockPath), "utf8");
+    const record = JSON.parse(raw) as Partial<LockOwnerRecord>;
+    if (typeof record.pid !== "number" || record.host !== os.hostname()) return false;
+    // A record with no lock dir is garbage from a crashed release — it is
+    // overwritten on the next successful acquire and never a reason to steal.
+    let lockMtime: number;
+    try {
+      lockMtime = statSync(lockPath).mtimeMs;
+    } catch {
+      return false;
+    }
+    if (Date.now() - lockMtime < STEAL_GRACE_MS) return false;
+    try {
+      process.kill(record.pid, 0);
+      return false; // alive (or at least answerable) — never steal
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ESRCH") return false; // EPERM = alive
+    }
+    unlinkSync(ownerRecordPath(lockPath));
+    rmSync(lockPath, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * In-process queue, one per store home.
@@ -64,6 +162,13 @@ export async function withLock<T>(
   home: string,
   lockWaitMs: number,
   fn: () => Promise<T>,
+  opts: {
+    /** ONLY `fimemory migrate` passes this: the migrate verb exists to REPAIR
+     * the very state (corrupt or behind schema.json) the gate refuses, so
+     * gating it would make the repair unreachable. Every other mutating op
+     * keeps the gate. */
+    skipSchemaGate?: boolean;
+  } = {},
 ): Promise<T> {
   const paths = storePaths(home);
   const key = fsPath(paths.home);
@@ -71,8 +176,8 @@ export async function withLock<T>(
   const prior = queues.get(key) ?? Promise.resolve();
   // Never let one caller's failure poison the queue for the next.
   const mine = prior.then(
-    () => holdAndRun(paths, lockWaitMs, fn),
-    () => holdAndRun(paths, lockWaitMs, fn),
+    () => holdAndRun(paths, lockWaitMs, fn, opts),
+    () => holdAndRun(paths, lockWaitMs, fn, opts),
   );
   // Keep the chain alive regardless of outcome, and drop the entry when this
   // is the last waiter so the map cannot grow without bound.
@@ -91,18 +196,20 @@ async function holdAndRun<T>(
   paths: ReturnType<typeof storePaths>,
   lockWaitMs: number,
   fn: () => Promise<T>,
+  opts: { skipSchemaGate?: boolean } = {},
 ): Promise<T> {
-  // Phase B: refuse writes when this client is older than the store format.
-  // Runs before the lockfile so a version skew fails fast without contending.
-  assertStoreWritable(paths.home);
+  // Phase B: refuse writes when this client is older than the store format
+  // (or the format marker is unparsable — 0.4). Runs before the lockfile so a
+  // version skew fails fast without contending.
+  if (!opts.skipSchemaGate) assertStoreWritable(paths.home);
 
-  let release: (() => Promise<void>) | undefined;
-  try {
-    release = await lockfile.lock(fsPath(paths.home), {
-      lockfilePath: fsPath(paths.lockfile),
+  const lockPath = fsPath(paths.lockfile);
+  const acquire = (retries: ReturnType<typeof retrySchedule>) =>
+    lockfile.lock(fsPath(paths.home), {
+      lockfilePath: lockPath,
       realpath: false,
       stale: 60_000,
-      retries: retrySchedule(lockWaitMs),
+      retries,
       // WITHOUT THIS, proper-lockfile's default is `(err) => { throw err; }`,
       // and it fires from a TIMER callback — so it lands as an uncaught
       // exception, and there is no `process.on("uncaughtException")` anywhere
@@ -120,16 +227,17 @@ async function holdAndRun<T>(
         );
       },
     });
-  } catch {
-    throw new GestaltError(
+
+  const lockedError = () =>
+    new GestaltError(
       "E_LOCKED",
       `Another FIMemory write is in progress (waited ${lockWaitMs} ms).`,
       // NEVER tell the reader to delete the lock directory. Two reasons, and
       // the second is why this changed on 2026-08-01.
       //
-      // It is unnecessary: `stale: 60_000` above means proper-lockfile reclaims
-      // an abandoned lock by itself on the next acquire (lockfile.js: "If it's
-      // stale, remove it and try again!"). Waiting IS the remedy.
+      // It is unnecessary: a lock whose holder died is reclaimed by liveness
+      // (the owner record above) or, absent a record, by proper-lockfile's own
+      // 60 s staleness on the next acquire. Waiting IS the remedy.
       //
       // And it is dangerous in a way the old "but check first" caveat could not
       // cover: deleting a LIVE lock kills the process holding it, and this hint
@@ -139,11 +247,35 @@ async function holdAndRun<T>(
       // part an eager agent skips.
       "Wait about a minute and try again — an abandoned lock expires on its own. If it persists, `fimemory doctor` reports what is holding the store.",
     );
+
+  let release: (() => Promise<void>) | undefined;
+  try {
+    release = await acquire(retrySchedule(lockWaitMs));
+  } catch {
+    // D7 liveness reclaim: a same-host owner record whose pid is provably dead
+    // earns exactly one steal + immediate re-acquire; anything less certain
+    // falls through to the same E_LOCKED as before.
+    if (tryStealDeadLock(lockPath)) {
+      try {
+        release = await acquire(retrySchedule(Math.min(lockWaitMs, 500)));
+      } catch {
+        throw lockedError();
+      }
+    } else {
+      throw lockedError();
+    }
   }
+  // Write (or overwrite a crashed predecessor's) owner record immediately —
+  // the mkdir-to-record gap is what the steal's grace window covers.
+  writeOwnerRecord(lockPath);
 
   try {
     return await fn();
   } finally {
+    // Owner record goes first: once it is gone a contender can no longer read
+    // a stale record during the release itself, and a record that outlives a
+    // successful release is plain garbage (handled as such by the steal path).
+    removeOwnerRecord(lockPath);
     try {
       await release();
     } catch {

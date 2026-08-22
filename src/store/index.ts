@@ -6,6 +6,7 @@ import { isoFromMs, msFromIso } from "../clock.js";
 import { recordIndexRepair } from "../telemetry.js";
 import { countTokens } from "../tokens.js";
 import { writeFileAtomic } from "./atomic.js";
+import { CLIENT_SCHEMA_VERSION, readStoreSchemaVersion } from "./schema.js";
 import { parseLog } from "./log.js";
 import { isTombstone, parseNote } from "./note.js";
 import type { TopicNote } from "./note.js";
@@ -107,8 +108,12 @@ export function serializeIndex(index: StoreIndex): string {
   );
 }
 
-export async function writeIndex(home: string, index: StoreIndex): Promise<void> {
-  await writeFileAtomic(storePaths(home).index, serializeIndex(index));
+export async function writeIndex(
+  home: string,
+  index: StoreIndex,
+  opts: { verify?: "strict" | "racedOk" } = {},
+): Promise<boolean> {
+  return writeFileAtomic(storePaths(home).index, serializeIndex(index), opts);
 }
 
 export async function readIndex(home: string): Promise<StoreIndex | null> {
@@ -527,7 +532,19 @@ export async function loadIndexOrEmpty(
     if (changedUnderUs) {
       return (await readIndex(home)) ?? index;
     }
-    await writeIndex(home, index);
+    // 0.4 skew-gate bypass closed: a v1 client that merely SEARCHES a newer
+    // store must not rebuild index.json with parsers that silently skip what
+    // they cannot read. Serve the in-memory index, write nothing.
+    if (readStoreSchemaVersion(home) > CLIENT_SCHEMA_VERSION) {
+      return index;
+    }
+    // Lock-free repair: verify with "racedOk" — a mismatch on the read-back
+    // means a real writer landed after us, which is the same benign race the
+    // byte/mtime check above yields to. Their index is at least as fresh.
+    const landed = await writeIndex(home, index, { verify: "racedOk" });
+    if (!landed) {
+      return (await readIndex(home)) ?? index;
+    }
     recordIndexRepair(home, reason, Object.keys(index.topics).length, {
       ...(skipped.length > 0 ? { skipped } : {}),
     });

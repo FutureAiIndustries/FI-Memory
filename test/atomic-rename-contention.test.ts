@@ -125,3 +125,36 @@ describe("atomic write under rename contention", () => {
     expect(readFileSync(file, "utf8")).toBe("original\n"); // untouched
   });
 });
+
+describe("verify-after-write (0.4) — the ACKed-write-that-vanished class", () => {
+  // renameWithRetry's contract "never returns success without the new bytes at
+  // `to`" previously held by construction only: nothing exercised a rename
+  // that REPORTS success while the target ends up wrong. These do.
+
+  it("a rename that lies (reports success, leaves the old bytes) is caught, not ACKed", async () => {
+    const file = freshFile();
+    // The lying filesystem: rename resolves fine and does nothing.
+    vi.spyOn(fsp, "rename").mockResolvedValue(undefined);
+    await expect(
+      writeFileAtomicPlain(file, "the new content\n", { verify: "strict" }),
+    ).rejects.toMatchObject({ code: "E_IO" });
+    // And the caller was told the truth: the old bytes are still there.
+    expect(readFileSync(file, "utf8")).toBe("original\n");
+  });
+
+  it("racedOk reports the loss quietly instead of throwing — the lock-free repair contract", async () => {
+    const file = freshFile();
+    vi.spyOn(fsp, "rename").mockResolvedValue(undefined);
+    await expect(
+      writeFileAtomicPlain(file, "the new content\n", { verify: "racedOk" }),
+    ).resolves.toBe(false);
+  });
+
+  it("an honest rename verifies clean and returns true", async () => {
+    const file = freshFile();
+    await expect(
+      writeFileAtomicPlain(file, "the new content\n", { verify: "strict" }),
+    ).resolves.toBe(true);
+    expect(readFileSync(file, "utf8")).toBe("the new content\n");
+  });
+});

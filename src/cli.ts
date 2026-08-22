@@ -51,6 +51,9 @@ import { reindexStore } from "./ops/reindexOp.js";
 import { buildDemoStore } from "./ops/demoStore.js";
 import { DEFAULT_CONFIG, loadConfig } from "./config.js";
 import { resolveHomeWithSource, storePaths } from "./paths.js";
+import { withLock } from "./store/lock.js";
+import { migrateStore } from "./store/schema.js";
+import { applyParked, discardParked, listParked, showParked } from "./ops/conflictsOp.js";
 import type { HomeSource } from "./paths.js";
 import {
   peekSessionCache,
@@ -135,6 +138,8 @@ Trust:
   doctor                       Check the whole setup — store mode, key sources, MCP registration, rules, last read
   update <id> [--file f | -]   Suggest a note edit (waits for your ok)
   review [list|show N|approve N|reject N]   See and apply suggested edits
+  conflicts [list|show P|apply P|discard P]   Work the pull resolver's parked queue
+                               (apply promotes a parked note into review)
   fold <id> [--since TS]       Get a compaction work packet (alias: compact)
 
 Your files (you own them):
@@ -197,6 +202,8 @@ Connect an AI tool (\`setup\` runs all of these for you):
 Maintenance:
   merge <loser> <winner>       Fold one topic into another
   reindex                      Rebuild the catalog from your files
+  migrate                      Move the store to this client's format (also
+                               backfills or repairs the schema.json marker)
   demo <dir>                   Build the try-it store (invented studio history) at <dir>
   encrypt                      Encrypt an existing plaintext store at rest (prints a 24-word recovery phrase)
   decrypt [--yes-plaintext-remote] [--remove-backup]
@@ -1401,6 +1408,64 @@ async function main(argv: string[]): Promise<number> {
         renderWarnings(r.warnings);
         return 0;
       }
+      case "migrate": {
+        // The one verb that runs with the schema gate off: it exists to repair
+        // the very states (corrupt or behind schema.json) the gate refuses.
+        const { config: migrateCfg } = loadConfig(storePaths(homePath).config);
+        const r = await withLock(homePath, migrateCfg.lockWaitMs, () => migrateStore(homePath), {
+          skipSchemaGate: true,
+        });
+        if (args.json) out(JSON.stringify({ ...r, homeSource }, null, 2));
+        else if (r.repairedCorrupt)
+          out(c.green(`Repaired schema.json — the store is marked format ${r.to}.`));
+        else if (r.wroteSchemaFile && r.from === r.to)
+          out(c.green(`Backfilled schema.json — this store now carries its format marker (${r.to}).`));
+        else if (r.from === r.to) out(`Nothing to do — the store is already format ${r.to}.`);
+        else out(c.green(`Migrated the store: format ${r.from} → ${r.to}.`));
+        return 0;
+      }
+      case "conflicts": {
+        const sub = args.positionals[0] ?? "list";
+        const target = args.positionals[1] ?? "";
+        if (sub === "list") {
+          const entries = listParked(homePath);
+          if (args.json) { out(JSON.stringify(entries, null, 2)); return 0; }
+          if (entries.length === 0) { out("No parked conflicts — the queue is empty."); return 0; }
+          out(c.b(`${entries.length} parked conflict(s):`));
+          for (const e of entries) {
+            out(`  ${e.parkedRel}  ${c.dim(`(${e.kind}, from ${e.originalRel})`)}`);
+            out(c.dim(`    ${followUp(homePath, `conflicts show ${e.parkedRel}`)}`));
+          }
+          return 0;
+        }
+        if (sub === "show") {
+          const r = await showParked(homePath, target);
+          if (args.json) { out(JSON.stringify(r, null, 2)); return 0; }
+          out(c.b(`${r.entry.parkedRel}`) + c.dim(`  (${r.entry.kind}, parked from ${r.entry.originalRel})`));
+          out();
+          out(r.text.trimEnd());
+          out();
+          if (r.entry.kind === "note") {
+            out(c.dim(`Promote to review: ${followUp(homePath, `conflicts apply ${r.entry.parkedRel}`)}   ·   Retire: ${followUp(homePath, `conflicts discard ${r.entry.parkedRel}`)}`));
+          } else {
+            out(c.dim(`Fold what matters by hand, then: ${followUp(homePath, `conflicts discard ${r.entry.parkedRel}`)}`));
+          }
+          return 0;
+        }
+        if (sub === "apply") {
+          const r = await applyParked(homePath, target);
+          if (args.json) { out(JSON.stringify(r, null, 2)); return 0; }
+          out(c.green(`Promoted — the parked version of "${r.id}" is now suggested edit ${r.handle}.`));
+          out(c.dim(`Review it: ${followUp(homePath, `review show ${r.handle}`)}`));
+          return 0;
+        }
+        if (sub === "discard") {
+          const e = await discardParked(homePath, target);
+          out(`Discarded ${e.parkedRel}. The deletion syncs with the next commit.`);
+          return 0;
+        }
+        return usageError(`conflicts: unknown subcommand "${sub}" (list | show <path> | apply <path> | discard <path>)`);
+      }
       case "mcp": {
         // Start the stdio MCP server and keep the process alive until stdin ends.
         runStdioServer(homePath, homeSource);
@@ -2379,21 +2444,34 @@ function readStdinWithDeadline(deadlineMs: number): Promise<string> {
 
 async function reviewCommand(args: Args, home: string): Promise<number> {
   const sub = args.positionals[0] ?? "list";
-  const seq = Number(args.positionals[1]);
+  // 0.4: the COMPLETE address is the machine-scoped handle `<machineId8hex>-<seq>`
+  // — seq alone is a per-clone counter that collides across a fleet (row 21:
+  // `review approve 1` on a seeded store approves the seed's leftover). Accept
+  // the handle here and route it to the (seq, --machine) pair the ops already
+  // take; bare seq keeps working (the seed proposal has no machineId).
+  let seqArg = args.positionals[1] ?? "";
+  let handleMachine: string | undefined;
+  const handleMatch = /^([0-9a-f]{8})-(\d+)$/.exec(seqArg);
+  if (handleMatch) {
+    handleMachine = handleMatch[1];
+    seqArg = handleMatch[2]!;
+  }
+  const seq = Number(seqArg);
+  const machineArg = args.machine ?? handleMachine;
 
   if (sub === "list") {
     const rows = await reviewList(home);
     if (args.json) { out(JSON.stringify(rows, null, 2)); return 0; }
     const pending = rows.filter((r) => r.status === "pending");
     if (pending.length === 0) out("No suggested edits waiting.");
-    for (const r of pending) out(`  ${c.b("#" + r.seq)} on ${r.id} ${c.dim(`by ${r.proposer}`)}  — ${followUp(home, `review show ${r.seq}`)}`);
+    for (const r of pending) { const handle = r.machineId ? `${r.machineId}-${r.seq}` : String(r.seq); out(`  ${c.b("#" + handle)} on ${r.id} ${c.dim(`by ${r.proposer}`)}  — ${followUp(home, `review show ${handle}`)}`); }
     const others = rows.filter((r) => r.status !== "pending");
     if (others.length) out(c.dim(`\n${others.length} resolved (approved/rejected/outdated).`));
     return 0;
   }
 
   if (sub === "show") {
-    const doc = await reviewShow(home, seq, args.machine);
+    const doc = await reviewShow(home, seq, machineArg);
     if (args.json) { out(JSON.stringify(doc, null, 2)); return 0; }
     out(c.b(`Suggested edit #${doc.seq} on "${doc.id}"`) + c.dim(`  (${doc.status}, by ${doc.proposer})`));
     const ownerChanged =
@@ -2402,19 +2480,22 @@ async function reviewCommand(args: Args, home: string): Promise<number> {
     out();
     out(insertionDiff(doc.oldNote, doc.newNote, "current", "suggested").trimEnd());
     out();
-    out(
-      c.dim(
-        `Apply: ${followUp(home, `review approve ${doc.seq}${ownerChanged ? " --allow-owner-notes" : ""}`)}` +
-          `   ·   Discard: ${followUp(home, `review reject ${doc.seq}`)}`,
-      ),
-    );
+    {
+      const handle = doc.machineId ? `${doc.machineId}-${doc.seq}` : String(doc.seq);
+      out(
+        c.dim(
+          `Apply: ${followUp(home, `review approve ${handle}${ownerChanged ? " --allow-owner-notes" : ""}`)}` +
+            `   ·   Discard: ${followUp(home, `review reject ${handle}`)}`,
+        ),
+      );
+    }
     return 0;
   }
 
   if (sub === "approve") {
     const r = await reviewApprove(home, seq, {
       allowOwnerNotes: args.allowOwnerNotes,
-      machineId: args.machine,
+      machineId: machineArg,
     });
     out(c.green(`Approved #${seq} — "${r.id}" updated.`));
     // reviewApprove has always returned warnings and this path always dropped
@@ -2428,7 +2509,7 @@ async function reviewCommand(args: Args, home: string): Promise<number> {
   }
 
   if (sub === "reject") {
-    const r = await reviewReject(home, seq, args.machine);
+    const r = await reviewReject(home, seq, machineArg);
     out(`Rejected #${seq} on "${r.id}". Nothing changed.`);
     return 0;
   }

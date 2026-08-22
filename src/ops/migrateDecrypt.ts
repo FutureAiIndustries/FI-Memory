@@ -267,6 +267,9 @@ const KNOWN_ATOMIC_TEMP_BASES = new Set([
 
 /** The transient write lock (a directory, created by proper-lockfile). */
 const LOCKFILE_NAME = ".gestalt.lock";
+/** The lock plus its D7 owner-record sibling (0.4) — machinery, never content. */
+const isLockMachinery = (name: string): boolean =>
+  name === LOCKFILE_NAME || name === `${LOCKFILE_NAME}.owner`;
 
 /** The whole-file seal's magic prefix (store/codec.ts `encryptFile`). */
 const ENC_MAGIC = "gestalt-enc:1:";
@@ -721,7 +724,11 @@ function censusFiles(home: string): Map<string, string> {
       // Our OWN write lock is transient by construction — it exists while the
       // "before" census is taken and is gone by the "after" one. Comparing it
       // would abort every single run. A peer holding it is checked directly.
-      if (relDir === "" && e.name === LOCKFILE_NAME) continue;
+      // Same for the lock's D7 owner-record sibling (0.4): it lives and dies
+      // with the lock, so it appears in one census and not the other on every
+      // healthy run — it is lock machinery, never store content.
+      if (relDir === "" && (e.name === LOCKFILE_NAME || e.name === `${LOCKFILE_NAME}.owner`))
+        continue;
       if (relDir === "" && e.name === ".git") {
         for (const g of [".git/HEAD", ".git/packed-refs"]) record(g, path.join(home, g));
         walk(".git/refs");
@@ -1460,7 +1467,7 @@ function copyCarriedEntries(home: string, staging: string, warn: (msg: string) =
   for (const entry of readdirSync(fsPath(home), { withFileTypes: true })) {
     const name = entry.name;
     if (REGENERATED.has(name) || DROPPED_OR_MOVED.has(name)) continue;
-    if (name === LOCKFILE_NAME || sibRe.test(name) || encryptSiblingTempRe(path.basename(home)).test(name)) {
+    if (isLockMachinery(name) || sibRe.test(name) || encryptSiblingTempRe(path.basename(home)).test(name)) {
       continue;
     }
     const tempBase = atomicTempBase(name);
@@ -1502,7 +1509,7 @@ function copyNonCanonicalContentEntries(
     for (const e of entries) {
       const name = e.name;
       if (isRegenerated(name)) continue;
-      if (name === LOCKFILE_NAME || sibRe.test(name)) continue;
+      if (isLockMachinery(name) || sibRe.test(name)) continue;
       if (atomicTempBase(name) !== null) {
         warn(
           `fimemory decrypt: left behind a leftover from an interrupted write, which is not one of your notes and was not copied: ${relDir}/${name}\n`,

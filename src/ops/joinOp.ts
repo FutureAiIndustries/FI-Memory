@@ -160,7 +160,7 @@ export async function joinStore(opts: JoinOptions): Promise<JoinResult> {
   // Ensure per-machine / derived paths stay gitignored.
   try {
     const gi = path.join(home, ".gitignore");
-    const required = [".gestalt.lock", "keyring.json", "index.json", "machine-id"];
+    const required = [".gestalt.lock", ".gestalt.lock.owner", ".*.tmp-*", "keyring.json", "index.json", "machine-id"];
     let body = existsSync(gi) ? readFileSync(gi, "utf8") : "";
     let changed = false;
     for (const line of required) {

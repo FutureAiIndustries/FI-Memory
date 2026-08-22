@@ -22,6 +22,8 @@ import {
 import { isWholeFileSealedPath } from "../store/codec.js";
 import { ENTRY_HEADER_RE, looksLikeEncryptedLog } from "../store/log.js";
 import { ENC_MAGIC } from "../store/wireFormat.js";
+import { sweepStoreTmp } from "../store/tmpResidue.js";
+import { CLIENT_SCHEMA_VERSION, readStoreSchema } from "../store/schema.js";
 import { conflicted, inProgress, isRepo } from "./gitState.js";
 import { checkIndexIntegrity } from "../store/index.js";
 import type { IndexIntegrity } from "../store/index.js";
@@ -959,8 +961,52 @@ export function runDoctor(opts: DoctorOptions = {}): DoctorReport {
           `\`${BIN} pull\` could not merge them automatically, so it kept your side live and put the other machine's ` +
           "side here. Nothing reads this directory: that content is invisible to search and to your agents.",
         hint:
-          `Open each one, fold anything worth keeping into the live note (\`${BIN} update\`), then delete the file. ` +
+          `Work the queue with \`${BIN} conflicts list\` → \`show\` (prints parked files DECODED, even on a sealed store) → ` +
+          `\`apply\` (promotes a parked note into the ordinary review queue) or \`discard\`. ` +
+          "Parked config/state files have no apply — show them, fold what matters by hand, then discard. " +
           "Warn, not fail: your data is intact and the store works — it is a queue, and it only becomes a problem if it is never worked.",
+      });
+    }
+
+    // 3a2. STORE FORMAT (0.4): doctor is the first tool a refused user runs,
+    // and until now it had no surface for the refusal's cause. A corrupt
+    // marker FAILS (writes are refused on it, and the remedy is one command);
+    // a store newer than the client FAILS with the upgrade hint; otherwise the
+    // version is simply reported nowhere — absence of a finding IS the report.
+    {
+      const schema = readStoreSchema(home);
+      if (schema.state === "corrupt") {
+        findings.push({
+          level: "fail",
+          code: "schema_corrupt",
+          message:
+            "schema.json exists but cannot be parsed — writes are refused because the store format cannot be proven writable.",
+          hint: `Run \`${BIN} migrate\` to repair the version marker, then retry. Reads still work meanwhile.`,
+        });
+      } else if (schema.version > CLIENT_SCHEMA_VERSION) {
+        findings.push({
+          level: "fail",
+          code: "schema_newer_than_client",
+          message: `The store is format ${schema.version}; this client understands up to ${CLIENT_SCHEMA_VERSION}. Writes are refused; reads may misread newer shapes.`,
+          hint: "Upgrade FIMemory on this machine, then retry.",
+        });
+      }
+    }
+
+    // 3b. CRASHED-WRITER TEMP RESIDUE (D5). Doctor never mutates, so this is a
+    // dry-run scan; the remedy it names — reindex — sweeps under the lock.
+    // Only residue the janitor WOULD remove (dead pid, or old) is reported;
+    // a fresh temp under a live pid is a writer mid-flight, not a finding.
+    const residue = sweepStoreTmp(home, Date.now(), { dryRun: true }).removed;
+    if (residue.length > 0) {
+      findings.push({
+        level: "warn",
+        code: "tmp_residue",
+        message:
+          `${residue.length} crashed-writer temp file(s) in the store: ${nameList(residue)} — ` +
+          "left behind by a writer that was killed mid-write. Harmless to your data, but they accumulate " +
+          "and have no reason to stay.",
+        hint: `Run \`${BIN} reindex\` — it sweeps them safely under the store lock.`,
       });
     }
 

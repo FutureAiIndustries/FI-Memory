@@ -114,11 +114,50 @@ export async function appendLog(
       raw: block,
     };
     const newLog = serializeLog(id, [...entries, appended]);
+    const priorLog = logText;
     await writeFileAtomic(topicLogPath(home, id), newLog);
+
+    // L2 VERIFY (0.4): prove the entry is durable AND parseable at the same
+    // surface `get` reads — byte-equal (L1, inside writeFileAtomic) is one
+    // level below "the reader can find it", which is the 8/19 lesson applied
+    // to durability. Runs under the store lock the op already holds, on a
+    // page-cache-hot KB-scale file. A key-state failure here must never be
+    // reported as a vanished write: E_STORE_MODE re-throws as itself.
+    {
+      const back = await readText(topicLogPath(home, id));
+      let found = false;
+      try {
+        found = back !== null && parseLog(back, id).entries.some((e) => e.timestamp === ts);
+      } catch (e) {
+        if (e instanceof GestaltError && e.code === "E_STORE_MODE") throw e;
+        found = false;
+      }
+      if (!found) {
+        throw new GestaltError(
+          "E_IO",
+          `verify-after-write: the entry just appended to "${id}" is not readable back from the log.`,
+          "The write was NOT acknowledged — retry the command, then `fimemory doctor`.",
+        );
+      }
+    }
 
     index.topics[id] = buildEntry(note, newLog);
     advanceGlobal(index, ts);
-    await writeIndex(home, index);
+    try {
+      await writeIndex(home, index);
+    } catch (e) {
+      // D9 (registry): without this, an index-write failure after the log
+      // landed produced NACK-but-landed — the caller was told failure, the
+      // entry was durable, and a retry duplicated it. Mirror create.ts: roll
+      // the log back to its prior bytes so the failure the caller sees is
+      // the truth on disk.
+      try {
+        await writeFileAtomic(topicLogPath(home, id), priorLog);
+      } catch {
+        /* rollback is best-effort; the original error stays primary */
+      }
+      throw e;
+    }
 
     return { timestamp: ts, entry: index.topics[id]!, warnings: parseWarnings };
   });

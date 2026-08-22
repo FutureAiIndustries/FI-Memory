@@ -152,6 +152,11 @@ export function runInit(opts: InitOptions = {}): InitResult {
     [
       "# Per-machine / derived — never sync (NEXUS-PHASE0-HANDOFF C1 / Decision 3).",
       ".gestalt.lock",
+      "# D7 liveness: the lock's sibling owner record (store/lock.ts).",
+      ".gestalt.lock.owner",
+      "# D5: atomic-write staging residue a killed writer can leave behind —",
+      "# never sync it (the janitor sweeps it; a synced orphan conflicts).",
+      ".*.tmp-*",
       "keyring.json",
       "index.json",
       "machine-id",

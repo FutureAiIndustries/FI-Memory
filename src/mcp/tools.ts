@@ -512,9 +512,9 @@ async function callToolInner(
         // No owner-notes override on the MCP surface — extra args are never read.
         const r = await updateTopic(home, id, note, { proposer: "mcp" });
         return {
-          text: `Suggested edit #${r.seq} on "${id}" is waiting for the human to approve. The note is unchanged until then.` + warningsText(r.warnings),
+          text: `Suggested edit ${r.machineId}-${r.seq} on "${id}" is waiting for the human to approve (\`review approve ${r.machineId}-${r.seq}\`). The note is unchanged until then.` + warningsText(r.warnings),
           isError: false,
-          structured: { warnings: r.warnings, seq: r.seq },
+          structured: { warnings: r.warnings, seq: r.seq, machineId: r.machineId, handle: `${r.machineId}-${r.seq}` },
         };
       }
       case "fimemory_compact": {

@@ -40,7 +40,7 @@ export async function updateTopic(
   id: string,
   proposedNote: string,
   opts: UpdateOptions = {},
-): Promise<{ seq: number; ownerNotesChanged: boolean; warnings: Warning[] }> {
+): Promise<{ seq: number; machineId: string; ownerNotesChanged: boolean; warnings: Warning[] }> {
   assertValidId(id); // no path join with an unvalidated id (traversal guard)
   const { config } = loadConfig(storePaths(home).config);
   const now = opts.now ?? systemClock;
@@ -152,6 +152,6 @@ export async function updateTopic(
     const warnings: Warning[] = ownerNotesChanged
       ? [{ id, code: "owner_notes", message: "this edit changes owner notes (override recorded on the proposal)" }]
       : [];
-    return { seq, ownerNotesChanged, warnings };
+    return { seq, machineId, ownerNotesChanged, warnings };
   });
 }

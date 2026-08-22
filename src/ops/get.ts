@@ -2,6 +2,7 @@ import { loadConfig } from "../config.js";
 import type { Warning } from "../errors.js";
 import { isValidId } from "../id.js";
 import { storePaths, topicLogPath, topicNotePath } from "../paths.js";
+import { warnStoreReadable } from "../store/schema.js";
 import { recordServed } from "../session.js";
 import { countTokens } from "../tokens.js";
 import { parseLog } from "../store/log.js";
@@ -69,6 +70,12 @@ export async function get(
   const { config } = loadConfig(storePaths(home).config);
   const logTailN = opts.logTail ?? 0;
   const warnings: Warning[] = [];
+  {
+    // 0.4: min_reader warning (see search.ts) — same rule on the read surface
+    // agents actually consume.
+    const readable = warnStoreReadable(home);
+    if (readable) warnings.push({ code: "schema_min_reader", message: readable });
+  }
   const reasons: string[] = [];
   let clamped = false;
 

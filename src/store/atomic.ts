@@ -91,11 +91,31 @@ const sleep = (ms: number): Promise<void> =>
 export async function writeFileAtomic(
   target: string,
   content: string,
-): Promise<void> {
+  opts: { verify?: VerifyMode } = {},
+): Promise<boolean> {
   // Encode through the storage codec (E0: identity) BEFORE the temp file is
-  // written, so an encrypted store's temp file never holds plaintext.
-  await writeFileAtomicPlain(target, encryptFile(target, content));
+  // written, so an encrypted store's temp file never holds plaintext — and the
+  // post-rename verify compares the ENCODED bytes, so it is codec-correct by
+  // construction. Store writes run under the store lock, so "strict" is the
+  // default HERE; the lock-free index repair passes "racedOk" and yields.
+  return writeFileAtomicPlain(target, encryptFile(target, content), {
+    verify: opts.verify ?? "strict",
+  });
 }
+
+/**
+ * How the post-rename read-back treats a byte mismatch (0.4 verify-after-write;
+ * the ACKed-write-that-vanished class — renameWithRetry's "never returns
+ * success without the new bytes at `to`" previously held by construction only):
+ *  - "strict"  — throw E_IO. Correct wherever the caller holds the store lock
+ *    (every mutating op), where nobody else may legally write the file.
+ *  - "racedOk" — return false. For the lock-free index repair, where a
+ *    concurrent writer landing different bytes is a benign lost race the
+ *    caller already knows how to yield to.
+ *  - false     — skip. For host-config installers outside the store, where
+ *    last-writer-wins was always the pre-existing contract.
+ */
+export type VerifyMode = "strict" | "racedOk" | false;
 
 /**
  * Same atomic temp+fsync+rename mechanics as `writeFileAtomic`, but withOUT the
@@ -108,11 +128,16 @@ export async function writeFileAtomic(
  *
  * Do NOT use this for store files: it would silently bypass at-rest encryption,
  * which is exactly the class of bug the codec's fail-closed default guards.
+ *
+ * Returns true when the write is verified at the target (or verification was
+ * skipped); false only under `verify: "racedOk"` when another writer's bytes
+ * are there instead.
  */
 export async function writeFileAtomicPlain(
   target: string,
   content: string,
-): Promise<void> {
+  opts: { verify?: VerifyMode } = {},
+): Promise<boolean> {
   const dir = path.dirname(target);
   // Create the parent if it is missing. This is not defensive padding: GIT DOES
   // NOT TRACK EMPTY DIRECTORIES, so a store cloned before it ever logged
@@ -167,6 +192,37 @@ export async function writeFileAtomicPlain(
 
   await renameWithRetry(tmp, target);
 
+  // VERIFY-AFTER-WRITE (0.4): read the target back and compare bytes. The
+  // worst failure a memory product can have is an ACKed write that vanished —
+  // an fs that lied, a rename that raced, a filter driver that intervened. The
+  // file was just written and fsynced, so this is a page-cache read + memcmp:
+  // sub-millisecond on KB-scale store files, and the caller already paid an
+  // fsync. The 8/19 lesson applies to durability too: assert at the surface
+  // the promise was made at, not one level below it.
+  //
+  // Default OFF here: bare Plain callers are the host-config installers, which
+  // are lock-free and whose pre-existing contract is last-writer-wins — a
+  // strict check there converts a benign lost race into a hard error. Store
+  // writes come through writeFileAtomic, which defaults to "strict".
+  const verify = opts.verify ?? false;
+  if (verify !== false) {
+    let landed: string | null = null;
+    try {
+      landed = await fsp.readFile(fsPath(target), "utf8");
+    } catch {
+      landed = null;
+    }
+    if (landed !== content) {
+      if (verify === "racedOk") return false;
+      throw new GestaltError(
+        "E_IO",
+        `verify-after-write: ${path.basename(target)} does not hold the bytes this write just renamed into place.`,
+        "The write was NOT acknowledged. The filesystem accepted the rename and then served different content — " +
+          "check for antivirus/sync tooling intercepting the store directory, retry the command, then `fimemory doctor`.",
+      );
+    }
+  }
+
   // Persist the directory entry so the rename survives power loss (best-effort).
   try {
     const dirHandle = await fsp.open(fsPath(dir), "r");
@@ -178,6 +234,7 @@ export async function writeFileAtomicPlain(
   } catch {
     /* directory fsync unsupported here (common on Windows) — best effort */
   }
+  return true;
 }
 
 /**

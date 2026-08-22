@@ -538,8 +538,10 @@ describe("a process killed mid-write", () => {
 
   // EXPECTED FAILURE (`it.fails`) — open defect, see docs/DEFECT-REGISTRY.md.
   // Green while the bug is open; goes RED the day it starts passing.
-  it.fails(
-    "the temp file a killed writer leaves behind is never swept by any later command",
+  it(
+    // D5 FIXED 2026-08-21: reindexStore sweeps crashed-writer residue under the
+    // store lock (store/tmpResidue.ts) — the CLI `reindex` leg below removes it.
+    "the temp file a killed writer leaves behind is swept by reindex",
     async () => {
       // Observed for real in the probe above: a SIGKILLed writer leaves
       // `topics/.shared-topic.md.tmp-<pid>-<n>` on disk. Whether a given kill
@@ -573,7 +575,7 @@ describe("a process killed mid-write", () => {
       const left = readdirSync(storePaths(home).topicsDir).filter((f) => f.includes(".tmp-"));
       expect(
         left,
-        "a crashed writer's temp file is never swept — it stays in the store forever",
+        "the D5 janitor (reindex, under the lock) must have removed the dead writer's temp",
       ).toEqual([]);
     },
     110_000,
@@ -770,9 +772,11 @@ describe("the store lock across processes", () => {
     70_000,
   );
 
-  // EXPECTED FAILURE (`it.fails`) — open defect, see docs/DEFECT-REGISTRY.md.
-  // Green while the bug is open; goes RED the day it starts passing.
-  it.fails(
+  // D7 FIXED 2026-08-21: the holder writes a sibling owner record and a refused
+  // contender steals a lock whose same-host owner pid is provably dead (ESRCH)
+  // after a 2 s grace — see store/lock.ts. The killed withLock holder below
+  // leaves a dead-pid record, so the next write reclaims promptly.
+  it(
     "a writer killed WITH the lock does not wedge every other tool's writes",
     async () => {
       // The scenario that actually happens: an MCP server is mid-write when its

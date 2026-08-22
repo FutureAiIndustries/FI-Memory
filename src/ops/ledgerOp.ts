@@ -94,6 +94,29 @@ export async function appendLedgerLine(
     events.push(written);
     await writeFileAtomic(file, serializeLedger(events));
 
+    // L2 VERIFY (0.4): the appended event must be readable back at the same
+    // surface consumers use — (machineId, seq) is its identity. Key-state
+    // failures re-throw as themselves, never as a vanished write.
+    {
+      const back = await readText(file);
+      let found = false;
+      try {
+        found =
+          back !== null &&
+          parseLedger(back).some((e) => e.machineId === machineId && e.seq === seq);
+      } catch (e) {
+        if (e instanceof GestaltError && e.code === "E_STORE_MODE") throw e;
+        found = false;
+      }
+      if (!found) {
+        throw new GestaltError(
+          "E_IO",
+          `verify-after-write: the event just appended to ledger "${topic}" is not readable back.`,
+          "The write was NOT acknowledged — retry the command, then `fimemory doctor`.",
+        );
+      }
+    }
+
     advanceGlobal(index, ts);
     await writeIndex(home, index);
 

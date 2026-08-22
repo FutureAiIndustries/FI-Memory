@@ -11,6 +11,7 @@ import { homeFlagFor } from "../followUp.js";
 import { GestaltError } from "../errors.js";
 import { sha256 } from "../hash.js";
 import { isValidId } from "../id.js";
+import { CLIENT_SCHEMA_VERSION, serializeSchemaFile } from "../store/schema.js";
 import {
   fsPath,
   proposalPath,
@@ -354,6 +355,9 @@ interface NotePlan {
   tie: boolean;
   /** False when both sides canonicalized to the same note — nothing to file. */
   needsProposal: boolean;
+  /** 0.4 delete-vs-edit: which side's DELETION was suppressed to keep the
+   * edit live, or null for an ordinary two-body conflict. */
+  suppressedDeletionOn: "this machine" | "the other machine" | null;
 }
 
 interface FilePlan {
@@ -464,11 +468,38 @@ export async function resolveConflicts(
   // `appendLog` is deliberately NOT called in here: it takes the store lock
   // itself, and `withLock`'s in-process queue is not reentrant, so a nested call
   // would deadlock against its own outer hold. It runs in phase 4.
+  //
+  // SCHEMA GATE, mid-merge (0.4). While schema.json is conflicted the WORKTREE
+  // copy holds git markers and reads as corrupt, which the write gate refuses —
+  // yet this resolver is exactly the code that repairs it. So: when schema.json
+  // is among the conflicts, decide from the clean INDEX STAGES up front —
+  // a side declaring a format newer than this client refuses the whole pull
+  // (an old client must not resolve a store it cannot faithfully write), and
+  // otherwise phase 3 runs with the gate skipped, because its own first order
+  // of business is writing the resolved schema.json.
+  const schemaPlan = parkPlans.find((pl) => pl.p.rel === "schema.json");
+  if (schemaPlan) {
+    const stagedMax = Math.max(
+      schemaVersionFromBytes(schemaPlan.p.ours.present ? schemaPlan.p.ours.bytes : null) ?? 1,
+      schemaVersionFromBytes(schemaPlan.p.theirs.present ? schemaPlan.p.theirs.bytes : null) ?? 1,
+    );
+    if (stagedMax > CLIENT_SCHEMA_VERSION) {
+      throw new GestaltError(
+        "E_SCHEMA",
+        `This pull brings store format ${stagedMax}; this client understands up to ${CLIENT_SCHEMA_VERSION}. ` +
+          "NOTHING WAS WRITTEN — the merge is untouched.",
+        `Upgrade FIMemory on this machine, then \`${BIN} pull\` again. To back out: \`${BIN} pull --abort\`.`,
+      );
+    }
+  }
   const toAdd: string[] = [];
   const toRemove: string[] = [];
   const minted: (MintedProposal | null)[] = [];
 
-  await withLock(home, config.lockWaitMs, async () => {
+  await withLock(
+    home,
+    config.lockWaitMs,
+    async () => {
     // The log writes must land before phase 4, NOT before the note writes below.
     //
     // Stated carefully because the earlier version of this comment claimed
@@ -504,9 +535,33 @@ export async function resolveConflicts(
     }
 
     for (const plan of parkPlans) {
+      // 0.4: a conflicted schema.json must resolve to the HIGHER version —
+      // "ours stays live" here let a v1 machine keep v1 live against the
+      // fleet's bump and park the bump where nothing reads it, silently
+      // disarming the skew gate fleet-wide. Both sides are tiny plaintext
+      // JSON; when both parse, the canonical file at max(ours, theirs) is
+      // fully derived and nothing needs parking. A side that does not parse
+      // falls through to the ordinary park.
+      if (plan.p.rel === "schema.json") {
+        const ourV = schemaVersionFromBytes(plan.p.ours.present ? plan.p.ours.bytes : null);
+        const theirV = schemaVersionFromBytes(plan.p.theirs.present ? plan.p.theirs.bytes : null);
+        if (ourV !== null && theirV !== null) {
+          const live = Math.max(ourV, theirV);
+          await writeFileAtomicPlain(path.join(home, plan.p.rel), serializeSchemaFile(live), {
+            verify: "strict",
+          });
+          toAdd.push(plan.p.rel);
+          result.advisories.push(
+            `schema.json conflict resolved to format ${live} (ours ${ourV}, theirs ${theirV}) — version resolution is max, never "ours".`,
+          );
+          continue;
+        }
+      }
       result.parked.push(await parkWholeFile(home, plan, toAdd, toRemove, result.advisories));
     }
-  });
+    },
+    { skipSchemaGate: schemaPlan !== undefined },
+  );
 
   // ── PHASE 4 — the provenance entry, one per resolved note.
   //
@@ -536,6 +591,12 @@ export async function resolveConflicts(
       logTimestamp: timestamp,
     });
 
+    if (plan.suppressedDeletionOn !== null) {
+      result.advisories.push(
+        `"${plan.id}": DELETED on ${plan.suppressedDeletionOn}, edited on the other — the EDIT was kept live. ` +
+          `If the deletion was meant, delete it again deliberately; nothing does that for you.`,
+      );
+    }
     if (proposal !== null && proposal.ownerNotesDiffer) {
       // R4 at the surface. Without this line the user meets a proposal that
       // refuses to approve, citing a protected section they never touched on
@@ -611,6 +672,16 @@ function nameSide(side: Side): string {
   return side === "ours" ? "local" : "incoming";
 }
 
+function unparsableSide(rel: string, side: Side): GestaltError {
+  return new GestaltError(
+    "E_SCHEMA",
+    `the ${nameSide(side)} version of ${rel} is not a valid note (no usable frontmatter), so there ` +
+      `is no \`updated:\` to compare and no body worth keeping safe. Nothing was written.`,
+    `Back the pull out with \`${BIN} pull --abort\` — both versions stay in git — then repair ` +
+      `whichever commit carries the broken note.`,
+  );
+}
+
 function markersInStage(rel: string, side: Side): GestaltError {
   return new GestaltError(
     "E_SCHEMA",
@@ -639,23 +710,38 @@ function planNote(home: string, p: ConflictPath): NotePlan {
   const id = p.id!;
 
   // A missing stage means one machine DELETED this note while the other edited
-  // it. A deletion carries no `updated:`, so the winner rule has nothing to
-  // compare and any choice made here would be invented policy — one of which
-  // silently un-deletes and the other silently deletes somebody's note.
+  // it. Through 0.3.x this REFUSED and handed the user raw git — the one
+  // conflict shape with no product flow. 0.4 rules it by the resolver's own
+  // charter: never drop a side, and a side that still has CONTENT outranks a
+  // side that has none, because a suppressed deletion is one deliberate delete
+  // away from restored intent while a dropped edit is gone. So the EDIT stays
+  // (or returns) live, and the suppressed deletion is said loudly — in the
+  // pull output and in the provenance log entry — never silently.
   for (const [side, stage] of sides(p)) {
     if (!stage.present) {
-      const keepEdit = side === "ours" ? "theirs" : "ours";
-      const deletedOn = side === "ours" ? "this machine" : "the other machine";
-      const editedOn = side === "ours" ? "the other machine" : "this machine";
-      throw new GestaltError(
-        "E_SCHEMA",
-        `${p.rel} was DELETED on ${deletedOn} and edited on ${editedOn}. There is no timestamp on a ` +
-          `deletion, so the merge rule cannot choose between them. Nothing was written.`,
-        `Decide by hand, then commit:\n` +
-          `  git -C ${home} checkout --${keepEdit} -- ${p.rel}   # keep the edit\n` +
-          `  git -C ${home} rm -- ${p.rel}                        # keep the deletion\n` +
-          `Or back the whole pull out with \`${BIN} pull --abort\`.`,
-      );
+      const editSide: Side = side === "ours" ? "theirs" : "ours";
+      const editStage = side === "ours" ? p.theirs : p.ours;
+      const deletedOn = side === "ours" ? ("this machine" as const) : ("the other machine" as const);
+      const text = decodeSide(p, editStage, editSide);
+      if (hasConflictMarkers(text)) throw markersInStage(p.rel, editSide);
+      const note = parseNote(text, id);
+      if (note === null) throw unparsableSide(p.rel, editSide);
+      const canonical = serializeNote(note);
+      return {
+        p,
+        id,
+        winnerText: canonical,
+        winnerNote: note,
+        loserNote: note,
+        proposedText: canonical,
+        proposedNote: note,
+        winner: editSide,
+        winnerUpdated: note.updated,
+        loserUpdated: null,
+        tie: false,
+        needsProposal: false,
+        suppressedDeletionOn: deletedOn,
+      };
     }
   }
 
@@ -734,6 +820,7 @@ function planNote(home: string, p: ConflictPath): NotePlan {
     // not a loser, and a proposal to replace a note with itself is noise in a
     // queue whose whole value is being short.
     needsProposal: proposedText !== winnerText,
+    suppressedDeletionOn: null,
   };
 }
 
@@ -887,6 +974,13 @@ function provenanceEntry(
 function richSummary(plan: NotePlan, minted: MintedProposal | null): string {
   const kept = plan.winner === "ours" ? "this machine's" : "the other machine's";
   const filed = plan.winner === "ours" ? "the other machine's" : "this machine's";
+  if (plan.suppressedDeletionOn !== null) {
+    return (
+      `Cross-machine merge on "${plan.id}": ${plan.suppressedDeletionOn} DELETED this note while the other ` +
+      `edited it — the edit was kept live (content outranks deletion; a suppressed delete is one deliberate ` +
+      `delete away, a dropped edit is gone). Delete again on purpose if the deletion was meant.`
+    );
+  }
   return minted === null
     ? `Cross-machine merge on "${plan.id}": both machines held the same note; kept ${kept} copy.`
     : `Cross-machine merge on "${plan.id}": kept ${kept} version (updated ${plan.winnerUpdated ?? "unknown"}` +
@@ -895,6 +989,9 @@ function richSummary(plan: NotePlan, minted: MintedProposal | null): string {
 }
 
 function shortSummary(plan: NotePlan, minted: { seq: number } | null): string {
+  if (plan.suppressedDeletionOn !== null) {
+    return `Cross-machine merge on "${plan.id}": a deletion on ${plan.suppressedDeletionOn} was suppressed; the edit stays live.`;
+  }
   return minted === null
     ? `Cross-machine merge on "${plan.id}": both machines held the same note.`
     : `Cross-machine merge on "${plan.id}": the other version is pending proposal #${String(minted.seq)}.`;
@@ -1086,6 +1183,19 @@ function parkedPathFor(p: ConflictPath, shortSha: string): string {
  * reopen the fail-closed hole: it cannot introduce cleartext the repository was
  * not already carrying.
  */
+/** Parse a schema.json side's version from raw bytes; null when unparsable
+ * (markers, truncation) — the caller then parks it like any other file. */
+function schemaVersionFromBytes(bytes: string | null): number | null {
+  if (bytes === null) return null;
+  try {
+    const parsed = JSON.parse(bytes) as { schema_version?: unknown };
+    const v = parsed.schema_version;
+    return typeof v === "number" && Number.isInteger(v) && v >= 1 ? v : null;
+  } catch {
+    return null;
+  }
+}
+
 async function parkWholeFile(
   home: string,
   plan: ParkPlan,
@@ -1097,14 +1207,14 @@ async function parkWholeFile(
   if (plan.parked !== "") {
     const target = path.join(home, plan.parked);
     await fsp.mkdir(fsPath(path.dirname(target)), { recursive: true });
-    await writeFileAtomicPlain(target, p.theirs.bytes);
+    await writeFileAtomicPlain(target, p.theirs.bytes, { verify: "strict" });
     toAdd.push(plan.parked);
   }
 
   if (p.ours.present) {
     // The worktree copy has markers spliced through it right now, so this is a
     // rewrite, not a no-op.
-    await writeFileAtomicPlain(p.abs, p.ours.bytes);
+    await writeFileAtomicPlain(p.abs, p.ours.bytes, { verify: "strict" });
     toAdd.push(p.rel);
     if (hasConflictMarkers(p.ours.bytes)) {
       // PRESERVED, not introduced: these markers are in the commit this branch
